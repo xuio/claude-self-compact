@@ -72,6 +72,12 @@ Set with `/config` (or `pluginConfigs` in `settings.json`):
    appended with `$.session.append` instead.
 4. `resume` is queued with `$.prompt.submit` and starts the next turn.
 
+If a prompt starts a turn before the compaction does (the desktop app sends a message typed
+during the turn right after the turn ends), the request stays pending and the compaction runs
+when that turn ends. Beside that prompt Claude reads a note that the compaction has not run
+yet, so it can replace the request (its `carry` and `resume` were written before the message)
+or cancel it.
+
 Guards: one request at a time; the minimum interval (kept per session in the plugin store, so
 a reload does not reset it); a turn the user stopped drops the request; subagents' compactions
 are left alone. Every decision is logged to `~/.claude/self-compact/mod.log` (last 400 lines)

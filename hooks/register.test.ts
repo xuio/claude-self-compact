@@ -1,4 +1,4 @@
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock, test, type TestBody } from 'claude-code/testing'
 import type { On, SessionMessage } from 'claude-code'
 
 const TOOL = 'mcp__self-compact__request_compaction'
@@ -19,18 +19,36 @@ function liveStore(on: On, store: Record<string, unknown>) {
 }
 
 function world(on: On, store: Record<string, unknown> = {}, live = false) {
-  const seen = { instructions: [] as (string | undefined)[], logs: [] as { text: string; to: string }[] }
+  const seen = {
+    instructions: [] as (string | undefined)[],
+    logs: [] as { text: string; to: string }[],
+    prompts: [] as { text: string; context?: readonly string[] }[],
+    commands: [] as string[],
+    compacts: 0,
+    clock: mock.clock(on, { now: 1_000_000_000 }),
+  }
   if (live) liveStore(on, store)
   else mock.store(on, store)
   on('ui.log', ($, e) => {
     seen.logs.push(e)
     return { value: undefined }
   })
-  mock.clock(on, { now: 1_000_000_000 })
+  on('ui.toast', () => ({ value: undefined }))
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  on('prompt.submit', ($, e) => {
+    seen.prompts.push({ text: e.text, context: e.context })
+    return { text: e.text, context: e.context }
+  })
+  on('command.run', ($, e) => {
+    seen.commands.push(e.command)
+    return { text: '' }
+  })
   on('session.id', () => ({ value: 'S1' }))
   on('session.messages', () => ({ value: [summary] }))
   mock.env(on, { HOME: '/nonexistent-home' })
   on('session.compact', ($, e) => {
+    seen.compacts++
     seen.instructions.push(e.instructions)
     return { messages: [summary], tokensBefore: 1000, tokensAfter: 100 }
   })
@@ -99,4 +117,41 @@ test('routine steps stay off the transcript', async ($, on) => {
   await $.session.compact({ trigger: 'manual', messages: [hello] })
   expect(seen.logs.length).toBe(2)
   expect(seen.logs.every(l => l.to === 'debug')).toBe(true)
+})
+
+// The desktop app sends a message typed mid-turn right after the turn ends: its
+// turn (T2) starts before the compaction requested in T1 runs (seen live).
+const ended = (turnId: string) =>
+  ({ turnId, reason: 'answer', isAborted: false, answer: '', durationMs: 1 }) as const
+
+async function queuedTurn($: Parameters<TestBody>[0], seen: ReturnType<typeof world>) {
+  await $.turn.start({ turnId: 'T1', text: 'work' })
+  await $.tool.call({ tool: TOOL, carry: 'c', resume: 'go on' } as never)
+  await $.turn.complete(ended('T1'))
+  await $.prompt.submit({ text: 'queued-test' } as never)
+  await $.turn.start({ turnId: 'T2', text: 'queued-test' })
+  await seen.clock.settle()
+}
+
+test('a turn that starts first keeps the request pending and cancellable', async ($, on) => {
+  const seen = world(on)
+  await queuedTurn($, seen)
+  expect(seen.compacts).toBe(0)
+  expect(JSON.stringify(seen.prompts[0]?.context ?? [])).toContain('has not run yet')
+  const cancelled = await $.tool.call({ tool: CANCEL } as never)
+  expect(JSON.stringify(cancelled)).toContain('Compaction cancelled')
+  await $.turn.complete(ended('T2'))
+  await seen.clock.advance(200_000)
+  expect(seen.compacts).toBe(0)
+  expect(seen.commands).toEqual([])
+})
+
+test('a deferred request runs when the other turn ends, then resumes', async ($, on) => {
+  const seen = world(on)
+  await queuedTurn($, seen)
+  expect(seen.compacts).toBe(0)
+  await $.turn.complete(ended('T2'))
+  await seen.clock.settle()
+  expect(seen.compacts).toBe(1)
+  expect(seen.prompts.map(p => p.text)).toEqual(['queued-test', 'go on'])
 })

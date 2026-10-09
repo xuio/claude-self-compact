@@ -16,6 +16,11 @@ import type { EngineInterface as Engine, Register, SessionMessage } from 'claude
 // Calling request_compaction again in the same turn replaces the request;
 // cancel_compaction drops it. Both are too late once the compaction runs.
 //
+// A prompt can start a turn before the compaction does (the desktop app sends a
+// message typed mid-turn right after the turn ends). The request then stays
+// pending, the model is told so beside that prompt, and the compaction runs when
+// that turn ends.
+//
 // Guards: one request at a time; at least minIntervalMinutes between
 // self-compactions (kept in $.store per session, so a reload does not reset it);
 // an aborted turn (the person pressed Stop) drops the request; every decision is
@@ -34,8 +39,16 @@ const LAST_KEY = 'lastAt'
 const DAY_MS = 24 * 3600_000
 
 type Job = { instructions?: string; carry?: string; resume?: string; carried?: boolean }
-let pending: Job | undefined
-let running: Job | undefined
+let pending: Job | undefined   // requested, not started: replace and cancel act on it
+let running: Job | undefined   // the compaction has started
+let scheduled: Job | undefined // a turn.complete callback is working on it
+let openTurn: string | undefined // the main loop's running turn (subagents raise no turn.start)
+
+const PENDING_NOTE =
+  'self-compact: the compaction you requested with request_compaction has not run yet. It ' +
+  'runs when this turn ends, with the instructions, carry and resume you gave before this ' +
+  'prompt. If they no longer fit, call request_compaction again to replace them, or ' +
+  'cancel_compaction to drop it.'
 
 const str = (v: unknown, max: number) =>
   typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : undefined
@@ -89,6 +102,59 @@ async function finish($: Engine, job: Job, how: string) {
   }
 }
 
+// Whether `job` must not run now: cancelled or replaced, or another turn started
+// first (then it stays pending and that turn's turn.complete runs it).
+async function superseded($: Engine, job: Job) {
+  if (pending !== job) return true
+  if (openTurn === undefined) return false
+  await log($, `deferred: turn ${openTurn} started first; compacting when it ends`)
+  return true
+}
+
+// Compacts for `job` unless superseded.
+async function compact($: Engine, job: Job, turnId: string) {
+  await log($, `turn ${turnId} complete; compacting`)
+  let lastErr = ''
+  let headless = false
+  for (let i = 0; i < RETRIES && !headless; i++) {
+    if (await superseded($, job)) return
+    running = job
+    try {
+      const res = await $.session.compact(job.instructions ? { instructions: job.instructions } : {})
+      pending = undefined
+      if (res.skip !== undefined) {
+        await log($, `skipped by a hook: ${res.skip}`)
+        $.ui.toast(`Self-compaction skipped: ${res.skip}`)
+        return
+      }
+      await finish($, job, `session.compact after ${i} retries`)
+      return
+    } catch (err) {
+      running = undefined
+      const msg = String(err).slice(0, 300)
+      // SDK-hosted sessions (Claude Desktop) cannot compact between turns yet:
+      // there a /compact command is the way, so stop retrying at once.
+      if (msg.includes('headless')) headless = true
+      else if (msg !== lastErr) await log($, `session.compact try ${i} rejected: ${msg}`)
+      lastErr = msg
+      if (!headless) await $.clock.sleep(RETRY_MS)
+    }
+  }
+  if (await superseded($, job)) return
+  // Headless (or still busy after the retries): run /compact as if the person
+  // typed it ($.prompt.submit refuses text starting with "/"); the engine
+  // queues it until the session is idle.
+  running = job
+  pending = undefined
+  try {
+    await $.command.run({ command: 'compact', args: job.instructions ?? '' })
+    await finish($, job, `/compact via command.run (${headless ? 'headless host' : 'retries exhausted'})`)
+  } catch (err) {
+    await log($, `/compact via command.run rejected: ${String(err).slice(0, 300)}`, true)
+    $.ui.toast('Self-compaction failed; see ~/.claude/self-compact/mod.log')
+  }
+}
+
 export const register: Register = (on, options) => {
   const alwaysInstructions = str(options.alwaysInstructions, MAX_TEXT)
   const alwaysCarry = str(options.alwaysCarry, MAX_TEXT)
@@ -107,7 +173,8 @@ export const register: Register = (on, options) => {
         'next step); it is placed after the summary unchanged. `resume`: optional prompt that ' +
         'starts your next turn after the compaction (omit to wait for the user). Calling it ' +
         'again in the same turn replaces the request (fields left out are dropped); ' +
-        'cancel_compaction cancels it. Refused if a self-compaction ran in the last ' +
+        'cancel_compaction cancels it (both work until the compaction starts). Refused if a ' +
+        'self-compaction ran in the last ' +
         `${minIntervalMs / 60_000} min.`,
       inputSchema: {
         type: 'object',
@@ -121,7 +188,7 @@ export const register: Register = (on, options) => {
     })
     await $.tool.register({
       name: CANCEL,
-      description: 'Cancel the compaction scheduled with request_compaction in this turn.',
+      description: 'Cancel the compaction requested with request_compaction (until it starts).',
       inputSchema: { type: 'object', properties: {} },
     })
     return started
@@ -155,7 +222,8 @@ export const register: Register = (on, options) => {
     }
   }).catch(() => ({ result: 'self-compact failed internally; nothing was scheduled.' }))
 
-  on('tool.call', { tool: CANCEL_FULL }, async ($, e) => {
+  // The generated tool types list only the tools connected at the last load.
+  on('tool.call', { tool: CANCEL_FULL as typeof FULL }, async ($, e) => {
     if (running) return { result: 'Too late: the compaction is already running.' }
     if (!pending) return { result: 'Nothing to cancel: no compaction is scheduled.' }
     pending = undefined
@@ -164,7 +232,8 @@ export const register: Register = (on, options) => {
   }).catch(() => ({ result: 'self-compact failed internally; the request may still be scheduled.' }))
 
   // Every compaction of the main conversation: add the configured instructions on
-  // the way down, the carried text after the summary on the way up.
+  // the way down, the carried text after the summary on the way up. No .catch
+  // fallback: it would run the compaction again when the engine refuses it.
   on('session.compact', async ($, e, next) => {
     if (e.agentId !== undefined || e.trigger === 'precompute') return next(e)
     const job = running
@@ -175,58 +244,43 @@ export const register: Register = (on, options) => {
     if (job) job.carried = true
     const sizes = res.tokensBefore ? ` ${res.tokensBefore} -> ${res.tokensAfter ?? '?'} tokens` : ''
     await log($, `compacted (${e.trigger}${job ? ', self' : ''})${sizes}${carry ? `; carried ${carry.length} chars` : ''}`)
+      .catch(() => {})
     return carry ? { ...res, messages: [...res.messages, carryMessage(carry)] } : res
+  })
+
+  // A prompt that starts a turn before the compaction did: tell the model the
+  // request is still pending (its carry and resume were written before this prompt).
+  on('prompt.submit', async ($, e, next) => {
+    if (!pending || running) return next(e)
+    await log($, 'a prompt started a turn first; the request stays pending')
+    return next({ ...e, context: [...(e.context ?? []), PENDING_NOTE] })
   }).catch(($, e, next) => next(e))
 
+  on('turn.start', ($, e, next) => {
+    openTurn = e.turnId
+    return next(e)
+  })
+
   on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined && openTurn === e.turnId) openTurn = undefined
     const done = await next(e)
-    if (e.agentId !== undefined || !pending) return done
-    const job = pending
-    pending = undefined
+    if (e.agentId !== undefined || !pending || running) return done
     if (e.isAborted || e.reason !== 'answer') {
+      pending = undefined
       await log($, `dropped (turn ended: ${e.reason})`)
       return done
     }
-    running = job
+    const job = pending
+    if (scheduled === job) return done
+    scheduled = job
     // Run outside this hook: the session must be idle for the compaction to be
     // accepted (Stop hooks of other plugins may keep it busy after turn.complete).
     $.clock.after(0, async () => {
       try {
-        await log($, `turn ${e.turnId} complete; compacting`)
-        let lastErr = ''
-        let headless = false
-        for (let i = 0; i < RETRIES && !headless; i++) {
-          try {
-            const res = await $.session.compact(job.instructions ? { instructions: job.instructions } : {})
-            if (res.skip !== undefined) {
-              await log($, `skipped by a hook: ${res.skip}`)
-              $.ui.toast(`Self-compaction skipped: ${res.skip}`)
-              return
-            }
-            await finish($, job, `session.compact after ${i} retries`)
-            return
-          } catch (err) {
-            const msg = String(err).slice(0, 300)
-            // SDK-hosted sessions (Claude Desktop) cannot compact between turns yet:
-            // there a /compact command is the way, so stop retrying at once.
-            if (msg.includes('headless')) headless = true
-            else if (msg !== lastErr) await log($, `session.compact try ${i} rejected: ${msg}`)
-            lastErr = msg
-            if (!headless) await $.clock.sleep(RETRY_MS)
-          }
-        }
-        // Headless (or still busy after the retries): run /compact as if the person
-        // typed it ($.prompt.submit refuses text starting with "/"); the engine
-        // queues it until the session is idle.
-        try {
-          await $.command.run({ command: 'compact', args: job.instructions ?? '' })
-          await finish($, job, `/compact via command.run (${headless ? 'headless host' : 'retries exhausted'})`)
-        } catch (err) {
-          await log($, `/compact via command.run rejected: ${String(err).slice(0, 300)}`, true)
-          $.ui.toast('Self-compaction failed; see ~/.claude/self-compact/mod.log')
-        }
+        await compact($, job, e.turnId)
       } finally {
-        running = undefined
+        if (scheduled === job) scheduled = undefined
+        if (running === job) running = undefined
       }
     })
     return done
