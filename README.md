@@ -72,7 +72,8 @@ Set with `/config` (or `pluginConfigs` in `settings.json`):
 
 Guards: one request at a time; the minimum interval (kept per session in the plugin store, so
 a reload does not reset it); a turn the user stopped drops the request; subagents' compactions
-are left alone. Every decision is logged to `~/.claude/self-compact/mod.log` (last 400 lines).
+are left alone. Every decision is logged to `~/.claude/self-compact/mod.log` (last 400 lines)
+and the debug log; only failures show in the transcript.
 
 ## Develop
 

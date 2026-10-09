@@ -9,8 +9,12 @@ const summary: SessionMessage = { role: 'user', text: 'SUMMARY', toolUses: [] }
 const hello: SessionMessage = { role: 'user', text: 'hello', toolUses: [] }
 
 function world(on: On, store: Record<string, unknown> = {}) {
-  const seen = { instructions: [] as (string | undefined)[] }
+  const seen = { instructions: [] as (string | undefined)[], logs: [] as { text: string; to: string }[] }
   mock.store(on, store)
+  on('ui.log', ($, e) => {
+    seen.logs.push(e)
+    return { value: undefined }
+  })
   mock.clock(on, { now: 1_000_000_000 })
   on('session.id', () => ({ value: 'S1' }))
   on('session.messages', () => ({ value: [summary] }))
@@ -56,4 +60,12 @@ test("another session's compaction does not count", async ($, on) => {
   world(on, { lastAt: { S2: 1_000_000_000 - 60_000 } })
   const res = await $.tool.call({ tool: TOOL } as never)
   expect(JSON.stringify(res)).toContain('Compaction scheduled')
+})
+
+test('routine steps stay off the transcript', async ($, on) => {
+  const seen = world(on)
+  await $.tool.call({ tool: TOOL } as never)
+  await $.session.compact({ trigger: 'manual', messages: [hello] })
+  expect(seen.logs.length).toBe(2)
+  expect(seen.logs.every(l => l.to === 'debug')).toBe(true)
 })

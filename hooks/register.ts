@@ -16,7 +16,8 @@ import type { EngineInterface as Engine, Register, SessionMessage } from 'claude
 // Guards: one request at a time; at least minIntervalMinutes between
 // self-compactions (kept in $.store per session, so a reload does not reset it);
 // an aborted turn (the person pressed Stop) drops the request; every decision is
-// logged to ~/.claude/self-compact/mod.log.
+// logged to ~/.claude/self-compact/mod.log. Only failures show in the transcript;
+// routine steps go to the debug log.
 
 const TOOL = 'request_compaction'
 const FULL = 'mcp__self-compact__request_compaction'
@@ -45,8 +46,8 @@ const carryMessage = (text: string): SessionMessage => ({
   toolUses: [],
 })
 
-async function log($: Engine, line: string) {
-  $.ui.log(`self-compact: ${line}`)
+async function log($: Engine, line: string, loud = false) {
+  $.ui.log(`self-compact: ${line}`, { to: loud ? 'transcript' : 'debug' })
   const home = await $.env.get('HOME')
   if (!home) return
   const path = `${home}/.claude/self-compact/mod.log`
@@ -124,7 +125,7 @@ export const register: Register = (on, options) => {
     const since = (await $.clock.now()) - (await lastAt($))
     if (since < minIntervalMs) {
       const why = `refused: last self-compaction ${Math.round(since / 1000)} s ago (min ${minIntervalMs / 1000} s)`
-      $.ui.log(`self-compact: ${why}`)
+      await log($, why)
       return { result: `Not scheduled (${why}).` }
     }
     pending = {
@@ -133,7 +134,7 @@ export const register: Register = (on, options) => {
       resume: str(input.resume, MAX_TEXT),
     }
     const extras = [pending.carry && 'carry', pending.resume && 'resume'].filter(Boolean).join(', ')
-    $.ui.log(`self-compact: scheduled for end of turn${extras ? ` (+ ${extras})` : ''}`)
+    await log($, `scheduled for end of turn${extras ? ` (+ ${extras})` : ''}`)
     return {
       result:
         'Compaction scheduled: it runs when this turn ends. End your turn now with one short ' +
@@ -162,7 +163,7 @@ export const register: Register = (on, options) => {
     const job = pending
     pending = undefined
     if (e.isAborted || e.reason !== 'answer') {
-      $.ui.log(`self-compact: dropped (turn ended: ${e.reason})`)
+      await log($, `dropped (turn ended: ${e.reason})`)
       return done
     }
     running = job
@@ -185,12 +186,12 @@ export const register: Register = (on, options) => {
             return
           } catch (err) {
             const msg = String(err).slice(0, 300)
-            if (msg !== lastErr) await log($, `session.compact try ${i} rejected: ${msg}`)
-            lastErr = msg
             // SDK-hosted sessions (Claude Desktop) cannot compact between turns yet:
             // there a /compact command is the way, so stop retrying at once.
             if (msg.includes('headless')) headless = true
-            else await $.clock.sleep(RETRY_MS)
+            else if (msg !== lastErr) await log($, `session.compact try ${i} rejected: ${msg}`)
+            lastErr = msg
+            if (!headless) await $.clock.sleep(RETRY_MS)
           }
         }
         // Headless (or still busy after the retries): run /compact as if the person
@@ -200,7 +201,7 @@ export const register: Register = (on, options) => {
           await $.command.run({ command: 'compact', args: job.instructions ?? '' })
           await finish($, job, `/compact via command.run (${headless ? 'headless host' : 'retries exhausted'})`)
         } catch (err) {
-          await log($, `/compact via command.run rejected: ${String(err).slice(0, 300)}`)
+          await log($, `/compact via command.run rejected: ${String(err).slice(0, 300)}`, true)
           $.ui.toast('Self-compaction failed; see ~/.claude/self-compact/mod.log')
         }
       } finally {
