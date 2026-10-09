@@ -28,9 +28,11 @@ Requires a Claude Code build with the plugin mods API (function hooks); develope
 
 ## Use
 
-The plugin adds one tool, `mcp__self-compact__request_compaction`. Claude calls it as the
-last action of a turn; the compaction runs when the turn ends. (In the desktop app the tool can
-still be listed as deferred; Claude then loads its schema with ToolSearch first.)
+The plugin adds the tool `mcp__self-compact__request_compaction`. Claude calls it as the
+last action of a turn; the compaction runs when the turn ends. Calling it again in the same turn
+replaces the request (fields left out are dropped), and `mcp__self-compact__cancel_compaction`
+cancels it; both are too late once the compaction has started. (In the desktop app the tools
+can still be listed as deferred; Claude then loads their schema with ToolSearch first.)
 
 | Field | What it does |
 | --- | --- |

@@ -2,15 +2,26 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { On, SessionMessage } from 'claude-code'
 
 const TOOL = 'mcp__self-compact__request_compaction'
+const CANCEL = 'mcp__self-compact__cancel_compaction'
 const summary: SessionMessage = { role: 'user', text: 'SUMMARY', toolUses: [] }
 
 // Beneath the plugin: a store, HOME, a log that goes nowhere, and a compaction
 // that answers one summary message.
 const hello: SessionMessage = { role: 'user', text: 'hello', toolUses: [] }
 
-function world(on: On, store: Record<string, unknown> = {}) {
+// A store the test itself can change between calls (mock.store keeps a copy).
+function liveStore(on: On, store: Record<string, unknown>) {
+  on('store.get', ($, e) => ({ value: store[e.key] }))
+  on('store.set', ($, e) => {
+    store[e.key] = e.value
+    return { value: undefined }
+  })
+}
+
+function world(on: On, store: Record<string, unknown> = {}, live = false) {
   const seen = { instructions: [] as (string | undefined)[], logs: [] as { text: string; to: string }[] }
-  mock.store(on, store)
+  if (live) liveStore(on, store)
+  else mock.store(on, store)
   on('ui.log', ($, e) => {
     seen.logs.push(e)
     return { value: undefined }
@@ -42,12 +53,32 @@ test('alwaysCarry lands after every compaction', { options: { alwaysCarry: 'Re-r
   expect(res.messages[1]?.text).toContain('<self-compact-carry>')
 })
 
-test('the tool refuses a second request in the same turn', async ($, on) => {
+test('a second request in the same turn replaces the first', async ($, on) => {
   world(on)
   const first = await $.tool.call({ tool: TOOL, carry: 'x' } as never)
   const second = await $.tool.call({ tool: TOOL } as never)
   expect(JSON.stringify(first)).toContain('Compaction scheduled')
-  expect(JSON.stringify(second)).toContain('Already scheduled')
+  expect(JSON.stringify(second)).toContain('request replaced')
+})
+
+test('a replacement is not refused by minIntervalMinutes', { options: { minIntervalMinutes: 10 } }, async ($, on) => {
+  const store: Record<string, unknown> = {}
+  world(on, store, true)
+  await $.tool.call({ tool: TOOL } as never)
+  store.lastAt = { S1: 1_000_000_000 }
+  const res = await $.tool.call({ tool: TOOL, carry: 'y' } as never)
+  expect(JSON.stringify(res)).toContain('request replaced')
+})
+
+test('cancel_compaction drops the request', async ($, on) => {
+  world(on)
+  const none = await $.tool.call({ tool: CANCEL } as never)
+  await $.tool.call({ tool: TOOL } as never)
+  const cancelled = await $.tool.call({ tool: CANCEL } as never)
+  const again = await $.tool.call({ tool: TOOL } as never)
+  expect(JSON.stringify(none)).toContain('Nothing to cancel')
+  expect(JSON.stringify(cancelled)).toContain('Compaction cancelled')
+  expect(JSON.stringify(again)).toContain('Compaction scheduled')
 })
 
 test('the tool refuses within minIntervalMinutes of the last self-compaction', { options: { minIntervalMinutes: 10 } }, async ($, on) => {
