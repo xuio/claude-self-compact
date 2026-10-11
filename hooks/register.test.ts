@@ -24,6 +24,8 @@ function world(on: On, store: Record<string, unknown> = {}, live = false) {
     logs: [] as { text: string; to: string }[],
     prompts: [] as { text: string; context?: readonly string[] }[],
     commands: [] as string[],
+    appended: [] as string[],
+    hold: false, // the plugin's own prompts wait (the session never goes idle)
     compacts: 0,
     clock: mock.clock(on, { now: 1_000_000_000 }),
   }
@@ -36,7 +38,12 @@ function world(on: On, store: Record<string, unknown> = {}, live = false) {
   on('ui.toast', () => ({ value: undefined }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
-  on('prompt.submit', ($, e) => {
+  on('session.append', ($, e, next) => {
+    seen.appended.push(JSON.stringify(e.message))
+    return next(e)
+  })
+  on('prompt.submit', async ($, e) => {
+    if (seen.hold && e.origin?.kind === 'plugin') await seen.clock.sleep(1e9)
     seen.prompts.push({ text: e.text, context: e.context })
     return { text: e.text, context: e.context }
   })
@@ -153,5 +160,23 @@ test('a deferred request runs when the other turn ends, then resumes', async ($,
   await $.turn.complete(ended('T2'))
   await seen.clock.settle()
   expect(seen.compacts).toBe(1)
-  expect(seen.prompts.map(p => p.text)).toEqual(['queued-test', 'go on'])
+  expect(seen.prompts.map(p => p.text.split('\n')[0])).toEqual(['queued-test', 'go on'])
+})
+
+// A subagent message queued during the compaction starts the next turn; the
+// resume prompt waits for an idle session (seen live in the desktop app).
+test('the resume text is carried and a waiting resume prompt blocks nothing', async ($, on) => {
+  const seen = world(on)
+  seen.hold = true
+  await $.turn.start({ turnId: 'T1', text: 'work' })
+  await $.tool.call({ tool: TOOL, carry: 'ids', resume: 'add the row' } as never)
+  await $.turn.complete(ended('T1'))
+  await seen.clock.settle()
+  expect(seen.compacts).toBe(1)
+  expect(seen.appended.join()).toContain('add the row')
+  expect(seen.prompts).toEqual([])
+  await $.turn.start({ turnId: 'T2', text: 'agent message' })
+  await seen.clock.advance(11 * 60_000)
+  const again = await $.tool.call({ tool: TOOL } as never)
+  expect(JSON.stringify(again)).toContain('Compaction scheduled')
 })

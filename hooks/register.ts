@@ -21,6 +21,11 @@ import type { EngineInterface as Engine, Register, SessionMessage } from 'claude
 // pending, the model is told so beside that prompt, and the compaction runs when
 // that turn ends.
 //
+// The resume prompt waits for an idle session, behind whatever was queued during
+// the compaction (subagent messages, task notifications), and can be the second
+// turn or later. So the resume text is also carried after the summary, where the
+// model reads it before any next message.
+//
 // Guards: one request at a time; at least minIntervalMinutes between
 // self-compactions (kept in $.store per session, so a reload does not reset it);
 // an aborted turn (the person pressed Stop) drops the request; every decision is
@@ -86,19 +91,34 @@ async function markDone($: Engine) {
   await $.store.set(LAST_KEY, { ...kept, [await $.session.id()]: now })
 }
 
+// What the job carries after the summary: its carry, then its resume text.
+const jobCarry = (job: Job) =>
+  join(
+    job.carry,
+    job.resume &&
+      'Next step (your resume prompt; it is also queued as a prompt, but a message ' +
+        'queued during the compaction can start the next turn first, so act on it ' +
+        'together with that message and skip it when the prompt arrives later):\n' + job.resume,
+  )
+
 // After a self-compaction: record it, carry the text if the session.compact hook
 // did not, and queue the resume prompt.
 async function finish($: Engine, job: Job, how: string) {
   await markDone($)
   await log($, `${how}: done`)
-  if (job.carry && !job.carried) {
-    await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: carryMessage(job.carry).text }] } })
+  const carry = jobCarry(job)
+  if (carry && !job.carried) {
+    await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: carryMessage(carry).text }] } })
     await log($, 'carry appended after the compaction (fallback)')
   }
   $.ui.toast('Self-compacted')
   if (job.resume) {
-    await $.prompt.submit({ text: job.resume })
+    // Not awaited: it resolves only when its turn starts, which can be much later.
     await log($, 'resume prompt queued')
+    void $.prompt
+      .submit({ text: job.resume + '\n\n(Queued when the compaction finished; the same text is in the carry block. Skip what you already did.)' })
+      .then(() => log($, 'resume prompt started its turn'))
+      .catch(err => log($, `resume prompt failed: ${String(err).slice(0, 300)}`, true))
   }
 }
 
@@ -240,7 +260,7 @@ export const register: Register = (on, options) => {
     const instructions = join(e.instructions, alwaysInstructions)
     const res = await next(instructions === e.instructions ? e : { ...e, instructions })
     if (res.skip !== undefined) return res
-    const carry = join(alwaysCarry, job?.carry)
+    const carry = join(alwaysCarry, job && jobCarry(job))
     if (job) job.carried = true
     const sizes = res.tokensBefore ? ` ${res.tokensBefore} -> ${res.tokensAfter ?? '?'} tokens` : ''
     await log($, `compacted (${e.trigger}${job ? ', self' : ''})${sizes}${carry ? `; carried ${carry.length} chars` : ''}`)

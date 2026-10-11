@@ -70,7 +70,10 @@ Set with `/config` (or `pluginConfigs` in `settings.json`):
 3. A `session.compact` hook adds `alwaysInstructions` on the way down and appends the carried
    text after the summary on the way up; if that hook did not see the compaction, the text is
    appended with `$.session.append` instead.
-4. `resume` is queued with `$.prompt.submit` and starts the next turn.
+4. `resume` is queued with `$.prompt.submit` and starts the next turn once the session is idle.
+   Messages queued during the compaction (a subagent's message, a task notification) go
+   first, so the resume text is also placed after the summary with the carried text: Claude
+   reads it before whichever message starts the next turn.
 
 If a prompt starts a turn before the compaction does (the desktop app sends a message typed
 during the turn right after the turn ends), the request stays pending and the compaction runs

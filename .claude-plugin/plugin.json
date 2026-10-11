@@ -1,6 +1,6 @@
 {
   "name": "self-compact",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Lets Claude compact its own context (a real /compact: the chat history stays visible), carry text verbatim across it and resume itself",
   "author": {
     "name": "Moritz Hoffmann",
