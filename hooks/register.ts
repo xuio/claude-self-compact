@@ -42,6 +42,9 @@ const MAX_TEXT = 8000
 const LOG_KEEP = 400
 const LAST_KEY = 'lastAt'
 const DAY_MS = 24 * 3600_000
+const FIELDS = ['instructions', 'carry', 'resume']
+// Keys a tool.call input carries beside the tool's own arguments.
+const RESERVED = ['tool', 'consent', 'tool_use_id', 'agentId']
 
 type Job = { instructions?: string; carry?: string; resume?: string; carried?: boolean }
 let pending: Job | undefined   // requested, not started: replace and cancel act on it
@@ -198,6 +201,7 @@ export const register: Register = (on, options) => {
         `${minIntervalMs / 60_000} min.`,
       inputSchema: {
         type: 'object',
+        additionalProperties: false,
         properties: {
           instructions: { type: 'string', description: 'What the summary must keep or stress.' },
           carry: { type: 'string', description: 'Text placed verbatim after the summary.' },
@@ -221,6 +225,16 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: FULL }, async ($, e) => {
     const input = e as unknown as Record<string, unknown>
     if (running) return { result: 'Not changed: the compaction is already running.' }
+    // A misspelled field (seen live: resume_prompt) would be dropped without a word.
+    const unknown = Object.keys(input).filter(k => !FIELDS.includes(k) && !RESERVED.includes(k))
+    if (unknown.length) {
+      await log($, `refused: unknown field ${unknown.join(', ')}`)
+      return {
+        result:
+          `Not scheduled: unknown field ${unknown.join(', ')}. The fields are ` +
+          `${FIELDS.join(', ')}; call request_compaction again with those.`,
+      }
+    }
     const replaced = pending !== undefined
     const since = (await $.clock.now()) - (await lastAt($))
     if (!replaced && since < minIntervalMs) {
@@ -235,9 +249,14 @@ export const register: Register = (on, options) => {
     }
     const extras = [pending.carry && 'carry', pending.resume && 'resume'].filter(Boolean).join(', ')
     await log($, `${replaced ? 'replaced' : 'scheduled'} for end of turn${extras ? ` (+ ${extras})` : ''}`)
+    const got = [
+      pending.instructions && `instructions ${pending.instructions.length} chars`,
+      pending.carry && `carry ${pending.carry.length} chars`,
+      pending.resume ? `resume ${pending.resume.length} chars` : 'no resume: after it the session waits for the user',
+    ].filter(Boolean).join('; ')
     return {
       result:
-        `Compaction ${replaced ? 'request replaced' : 'scheduled'}: it runs when this turn ends. ` +
+        `Compaction ${replaced ? 'request replaced' : 'scheduled'} (${got}): it runs when this turn ends. ` +
         'End your turn now with one short line; do not start new work in this turn.',
     }
   }).catch(() => ({ result: 'self-compact failed internally; nothing was scheduled.' }))

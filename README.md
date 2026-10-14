@@ -40,6 +40,9 @@ can still be listed as deferred; Claude then loads their schema with ToolSearch 
 | `carry` | Text placed **verbatim** after the summary, never summarized: ids, paths, branch names, the exact next step. |
 | `resume` | A prompt that starts Claude's next turn after the compaction. Omit it to wait for the user. |
 
+Any other field is refused (nothing is scheduled), so a misspelled `resume` is not silently
+dropped; the tool's answer lists what was scheduled.
+
 A prompt that makes use of it:
 
 > When your context gets large, write durable state to files, then call

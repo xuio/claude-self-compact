@@ -180,3 +180,14 @@ test('the resume text is carried and a waiting resume prompt blocks nothing', as
   const again = await $.tool.call({ tool: TOOL } as never)
   expect(JSON.stringify(again)).toContain('Compaction scheduled')
 })
+
+test('a misspelled field is refused, not dropped', async ($, on) => {
+  const seen = world(on)
+  const bad = await $.tool.call({ tool: TOOL, carry: 'c', resume_prompt: 'go on' } as never)
+  expect(JSON.stringify(bad)).toContain('unknown field resume_prompt')
+  const none = await $.tool.call({ tool: CANCEL } as never)
+  expect(JSON.stringify(none)).toContain('Nothing to cancel')
+  const ok = await $.tool.call({ tool: TOOL, carry: 'c' } as never)
+  expect(JSON.stringify(ok)).toContain('no resume')
+  expect(seen.logs.some(l => l.text.includes('refused: unknown field'))).toBe(true)
+})
