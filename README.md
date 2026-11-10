@@ -39,7 +39,7 @@ The same plugin is also shipped in the
 [multi-agent playbook](https://github.com/xuio/claude-code-multi-agent-playbook/tree/main/plugins/self-compact)
 repository. Install it from one place only: both copies register the same tools.
 
-Requires a Claude Code build with the plugin mods API (function hooks). Version 0.6.0 passes
+Requires a Claude Code build with the plugin mods API (function hooks). Version 0.6.1 passes
 `claude plugin test` on 2.1.301 and type-checks against the 2.1.321 API. The API is early
 access and may change between releases.
 
@@ -57,7 +57,7 @@ Claude then loads their schema with ToolSearch first.)
 | --- | --- |
 | `instructions` | What the summary must keep or stress (the text after `/compact`). |
 | `carry` | Text placed **verbatim** after the summary, never summarized: ids, paths, branch names, the exact next step. |
-| `resume` | A prompt that starts Claude's next turn after the compaction. Omit it to wait for the user. |
+| `resume` | A prompt that starts Claude's next turn after the compaction. Omit it to wait for the user. If another message starts that turn first, the prompt follows only when that turn did little work (see "How it works"). |
 
 Each field holds at most 8,000 characters. A longer field, or a field with another name, is
 **refused** and nothing is scheduled: nothing is cut or dropped without a word. Long state
@@ -175,6 +175,7 @@ Set with `/config` (or `pluginConfigs` in `settings.json`):
 | `burstWindowMinutes` | 30 | The window `burstLimit` counts over. |
 | `minContextTokens` | 0 | Smallest context worth compacting. 0 = no check. |
 | `minIntervalMinutes` | 0 | Fixed minimum time between two self-compactions. 0 = off. |
+| `resumeSkipAfterToolCalls` | 10 | When another message starts the turn after a compaction first, drop the resume prompt if the main agent made at least this many tool calls by the end of that turn; with fewer it is sent then. Keep it above the number of calls your orientation after a compaction takes: a turn that only oriented has not done the next step. 0 = send it at once, as before 0.6.1. |
 
 ### The instructions file
 
@@ -219,11 +220,23 @@ folder.
    `alwaysInstructions` and the instructions file are added to the instructions on both paths.
 3. The carried text (`alwaysCarry`, `carry`, and the `resume` text) is appended after the
    summary: by the `session.compact` hook where it sees the compaction, otherwise with
-   `$.session.append` right after it. Either way it lands once.
-4. `resume` is queued with `$.prompt.submit` and starts the next turn once the session is idle.
-   Messages queued during the compaction (a subagent's message, a task notification) go
-   first, so the resume text is also placed after the summary with the carried text: Claude
-   reads it before whichever message starts the next turn.
+   `$.session.append` right after it. Either way it lands once. The block says that where the
+   summary and the block disagree, the block is right: Claude wrote the carry itself just
+   before the compaction, while the summary is a summarizer's rewrite.
+4. A message queued during the compaction (a subagent's message, a task notification) can
+   start the next turn before the resume prompt. So the resume text is also placed after the
+   summary with the carried text, and Claude acts on it together with whichever message starts
+   the next turn. The prompt itself is held back for 1.5 s. If no turn starts, it is sent with
+   `$.prompt.submit`. If one does, the plugin counts the main agent's tool calls (sub-agents do
+   not count) until that turn ends: at `resumeSkipAfterToolCalls` (default 10) or more the next
+   step was done there and the prompt is dropped; with fewer (an answer to a notice, or only
+   the orientation after the compaction) it is sent then, so an unattended agent does not sit
+   idle. The default is 10 because an orientation routine can take 7 or 8 calls by itself, and
+   a wrong drop leaves the agent idle, while a wrong send costs one turn. If the turn's end is
+   never reported, the prompt is decided the same way when the plugin finds no tool call of the
+   main agent in a 10-minute window, which is 10 to 20 minutes after the last one. A new request, `cancel_compaction` or the
+   session ending drops a held prompt. `resumeSkipAfterToolCalls: 0` sends it at once, as
+   before 0.6.1.
 
 What Claude is told beside a prompt, each at most once per turn:
 
@@ -243,6 +256,14 @@ session are written in order, but two sessions logging at the same moment can lo
 The log is a debugging aid, not a record.
 
 ## Changes since 0.3.2
+
+**0.6.1: no extra turn for the resume prompt.** When a queued message started the turn after a
+compaction, the agent did the next step there and the resume prompt then cost one more turn
+(seen in use). The prompt is now held back and dropped when that turn did the work
+(`resumeSkipAfterToolCalls`, default 10 tool calls). The carry block also says that it wins over
+the summary. Fixed: a sub-agent's turn that started while a request waited was taken for a
+turn of the main agent, and the compaction then waited for the main agent's next turn to end
+(seen in the log).
 
 **0.6.0: for an agent that never asks.** Three new options, all off by default:
 `remindAtTokens` reminds the main agent to request a compaction, `autoCompactAtTokens` lets the
@@ -281,7 +302,7 @@ often did not.
   vanished without a word; Claude could believe its context had been compacted.
 - **Log lines carry the session id**, and one session's lines no longer overwrite each other.
 
-All of this is covered by the tests in `hooks/register.test.ts` (54 tests). At the time of
+All of this is covered by the tests in `hooks/register.test.ts` (74 tests). At the time of
 writing they had not yet run in a long live session; ending a turn from the plugin, the
 reminder, the plugin's own compaction and the instructions file in particular have only run in
 the test engine.

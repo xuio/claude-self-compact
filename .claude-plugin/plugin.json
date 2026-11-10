@@ -1,6 +1,6 @@
 {
   "name": "self-compact",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Lets Claude compact its own context (a real /compact: the chat history stays visible), carry text verbatim across it and resume itself",
   "author": {
     "name": "Moritz Hoffmann",
@@ -72,6 +72,12 @@
       "title": "Compact by itself from this context size, in tokens",
       "description": "A safety net: when a turn of the main agent ends normally with no request waiting and the context is at least this size, the plugin compacts by itself (fixed instructions and 'Always carry' only; no next step is carried, no resume). At most once per 10 minutes. Set it below the host's automatic compaction. 0 = off (the default).",
       "default": 0
+    },
+    "resumeSkipAfterToolCalls": {
+      "type": "number",
+      "title": "Drop the resume prompt after this many tool calls",
+      "description": "When another message starts the turn after a compaction first, the resume prompt is sent when that turn ends, unless the main agent made at least this many tool calls in it (then the next step was done there). Keep it above the calls your orientation after a compaction takes. 0 = always send it at once, as before 0.6.1.",
+      "default": 10
     }
   },
   "homepage": "https://github.com/xuio/claude-self-compact",

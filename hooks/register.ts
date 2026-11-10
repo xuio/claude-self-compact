@@ -32,10 +32,15 @@ import type { EngineInterface as Engine, Register, SessionMessage } from 'claude
 // pending, the model is told so beside that prompt (once per turn), and the
 // compaction runs when that turn ends.
 //
-// The resume prompt waits for an idle session, behind whatever was queued during
-// the compaction (subagent messages, task notifications), and can be the second
-// turn or later. So the resume text is also carried after the summary, where the
-// model reads it before any next message.
+// A message queued during the compaction (a subagent message, a task notification)
+// can start the next turn before the resume prompt. So the resume text is also
+// carried after the summary, and the prompt is held back for SETTLE_MS: if no turn
+// starts, it is sent; if one does, it is sent when that turn ends with fewer than
+// resumeSkipAfterToolCalls main-loop tool calls, and dropped otherwise (the work
+// was done there). A held prompt never waits for good: it is looked at every
+// STALL_MS, and when the main loop made no tool call in that time, it is decided the
+// same way without that turn's end.
+// resumeSkipAfterToolCalls 0 sends it at once, as before 0.6.1.
 //
 // Guards:
 //   - only the main agent: a sub-agent's call is refused (it would compact the
@@ -82,6 +87,10 @@ const AUTO_GAP_MS = 10 * 60_000
 const REMIND_STEP = 20_000 // within one turn the reminder comes again after this much growth
 const DAY_MS = 24 * 3600_000
 const IDLE = '(idle)'
+const SETTLE_MS = 1500 // how long the resume prompt waits for another turn to start first
+const STALL_MS = 10 * 60_000 // a held resume prompt is decided after this long without a main-loop tool call
+const RESUME_NOTE =
+  '\n\n(Queued when the compaction finished; the same text is in the carry block. Skip what you already did.)'
 const FIELDS = ['instructions', 'carry', 'resume'] as const
 // Keys a tool.call input carries beside the tool's own arguments.
 const RESERVED = ['tool', 'consent', 'tool_use_id', 'agentId', 'requestMeta']
@@ -97,6 +106,13 @@ type Job = {
   forced?: boolean  // the plugin is ending the turn itself, so that the compaction can run
   auto?: number     // an own compaction: the context size that started it
 }
+// A resume prompt after a compaction, until its turn starts or it is dropped.
+type Resume = {
+  text: string
+  calls: number  // main-loop tool calls since the compaction
+  turn?: string  // the main-loop turn that started before the prompt was sent
+  sent?: boolean // submitted; waiting for its turn
+}
 type Config = {
   alwaysInstructions?: string
   alwaysCarry?: string
@@ -109,9 +125,11 @@ type Config = {
   minContextTokens: number
   blockTools: boolean
   allowAfter: string[]
+  resumeSkip: number
 }
 
 let cfg: Config = {
+  resumeSkip: 10,
   remindAt: 0,
   autoAt: 0,
   minIntervalMs: 0,
@@ -124,12 +142,14 @@ let cfg: Config = {
 let pending: Job | undefined   // requested, not started: replace and cancel act on it
 let running: Job | undefined   // the compaction has started
 let scheduled: Job | undefined // a turn.complete callback is working on it
-let openTurn: string | undefined // the main loop's running turn (subagents raise no turn.start)
+let openTurn: string | undefined // the main loop's running turn (a sub-agent's turn.start is not noted)
 let lost: string | undefined   // why the last request did not end in a compaction, until the model is told
 let reminded: string | undefined // the turn that got the remindAtTokens note (IDLE until its turn starts)
 let remindedAt = 0             // the context size that note named
 let autoUnmeasured = false     // an own compaction ran and its result size is not known yet
 let autoHeld = false           // an own compaction left the context above the threshold
+let resume: Resume | undefined // the resume prompt of the last compaction, held back or sent
+let stale: Resume | undefined  // a sent resume prompt that was dropped before its turn started
 const warned = new Set<string>() // log lines written once per session
 let logTail: Promise<void> = Promise.resolve()
 
@@ -227,7 +247,8 @@ const carryMessage = (text: string): SessionMessage => ({
   role: 'user',
   text:
     '<self-compact-carry>\nCarried verbatim across the compaction above by the self-compact ' +
-    'plugin (not summarized; written before compacting):\n\n' + text + '\n</self-compact-carry>',
+    'plugin (not summarized; written before compacting). Where the summary above and this ' +
+    'block disagree, this block is right:\n\n' + text + '\n</self-compact-carry>',
   toolUses: [],
 })
 
@@ -385,13 +406,87 @@ const jobCarry = (job: Job) =>
   join(
     job.carry,
     job.resume &&
-      'Next step (your resume prompt; it is also queued as a prompt, but a message ' +
-        'queued during the compaction can start the next turn first, so act on it ' +
-        'together with that message and skip it when the prompt arrives later):\n' + job.resume,
+      (cfg.resumeSkip
+        ? 'Next step (your resume prompt; act on it in the next turn, together with whatever ' +
+          'message starts that turn. The prompt comes separately only if that turn does no ' +
+          'real work):\n'
+        : 'Next step (your resume prompt; it is also queued as a prompt, but a message ' +
+          'queued during the compaction can start the next turn first, so act on it ' +
+          'together with that message and skip it when the prompt arrives later):\n') + job.resume,
   )
 
+// Submits the resume prompt. Not awaited: it resolves only when its turn starts.
+function sendResume($: Engine, text: string, r?: Resume) {
+  if (r) r.sent = true
+  // The prompt.submit guard knows a prompt by its text only. A dropped prompt with the
+  // same text must not take this one with it: rather one prompt too many than none.
+  if (stale?.text === text) stale = undefined
+  void $.prompt
+    .submit({ text: text + RESUME_NOTE })
+    .then(res => {
+      if (r && resume === r) resume = undefined
+      if (r && stale === r) stale = undefined
+      return log($, res.drop !== undefined ? `resume prompt did not start: ${res.drop}` : 'resume prompt started its turn')
+    })
+    .catch(err => log($, `resume prompt failed: ${String(err).slice(0, 300)}`, true))
+}
+
+// After SETTLE_MS: send the held prompt, unless a main-loop turn started first
+// (then that turn's end decides).
+// Nothing is awaited between the check and the send (here and in decideResume): a
+// request that drops the prompt, or a second decision, cannot come in between.
+async function settleResume($: Engine, r: Resume) {
+  if (resume !== r || r.sent) return
+  r.turn ??= openTurn
+  if (r.turn !== undefined) {
+    watchResume($, r)
+    await log($, `resume prompt held: turn ${r.turn} started first; deciding when it ends`)
+    return
+  }
+  sendResume($, r.text, r)
+  await log($, 'resume prompt queued')
+}
+
+// A turn's end may never be reported, and then nothing else would decide a held prompt.
+// So it is looked at again every STALL_MS: when the main loop made no tool call in that
+// time, it is decided as at a turn's end (so STALL_MS to twice that after the last call).
+// If the turn is still running after all (one long tool call), a prompt sent now waits
+// behind it; at worst that costs one turn.
+function watchResume($: Engine, r: Resume) {
+  const calls = r.calls
+  $.clock.after(STALL_MS, () => {
+    if (resume !== r || r.sent) return
+    if (r.calls !== calls) return watchResume($, r)
+    void decideResume($, r, `made no tool call for ${STALL_MS / 60_000} min, its end was not reported,`).catch(() => {})
+  })
+}
+
+// At the end of the main-loop turn the prompt is held for, or from watchResume. Both can
+// come for the same prompt, and a request can drop it meanwhile: decided once, and only
+// while it is still the held one.
+async function decideResume($: Engine, r: Resume, how = 'ended') {
+  if (resume !== r || r.sent) return
+  if (r.calls >= cfg.resumeSkip) {
+    resume = undefined
+    await log($, `resume prompt dropped: ${r.calls} tool calls since the compaction`)
+    return
+  }
+  sendResume($, r.text, r)
+  await log($, `resume prompt queued: turn ${r.turn} ${how} after ${r.calls} tool calls`)
+}
+
+// A new request, a cancel or the session's end drops the resume prompt still held.
+async function dropResume($: Engine, why: string) {
+  const r = resume
+  if (!r) return false
+  resume = undefined
+  if (r.sent) stale = r
+  await log($, `resume prompt dropped: ${why}`)
+  return true
+}
+
 // After a self-compaction: record it, carry the text if the session.compact hook
-// did not (it does not run in every host), and queue the resume prompt.
+// did not (it does not run in every host), and queue or hold back the resume prompt.
 async function finish($: Engine, job: Job, how: string) {
   await markDone($)
   await log($, `${how}: done`)
@@ -401,14 +496,16 @@ async function finish($: Engine, job: Job, how: string) {
     await log($, `carry appended after the compaction (fallback, ${carry.length} chars)`)
   }
   $.ui.toast('Self-compacted')
-  if (job.resume) {
-    // Not awaited: it resolves only when its turn starts, which can be much later.
+  if (!job.resume) return
+  if (!cfg.resumeSkip) {
     await log($, 'resume prompt queued')
-    void $.prompt
-      .submit({ text: job.resume + '\n\n(Queued when the compaction finished; the same text is in the carry block. Skip what you already did.)' })
-      .then(() => log($, 'resume prompt started its turn'))
-      .catch(err => log($, `resume prompt failed: ${String(err).slice(0, 300)}`, true))
+    sendResume($, job.resume)
+    return
   }
+  const r: Resume = { text: job.resume, calls: 0, turn: openTurn }
+  resume = r
+  await log($, `resume prompt held for ${SETTLE_MS} ms`)
+  $.clock.after(SETTLE_MS, () => settleResume($, r).catch(() => {}))
 }
 
 // Whether `job` must not run now: cancelled or replaced, or another turn started
@@ -559,6 +656,7 @@ export const register: Register = (on, options) => {
     minContextTokens: num(options.minContextTokens, 0),
     blockTools: options.blockToolsAfterRequest !== false && options.blockToolsAfterRequest !== 'false',
     allowAfter: (str(options.allowAfterRequest) ?? '').split(/[\s,]+/).filter(Boolean),
+    resumeSkip: Math.floor(num(options.resumeSkipAfterToolCalls, 10)),
   }
   const limits = [
     cfg.burstLimit && `after ${cfg.burstLimit} self-compactions within ${cfg.burstWindowMs / 60_000} min`,
@@ -581,7 +679,12 @@ export const register: Register = (on, options) => {
         'Before calling, make sure durable state lives in files. `instructions`: what the ' +
         'summary must keep. `carry`: text you need verbatim afterwards (ids, paths, the exact ' +
         'next step); it is placed after the summary unchanged. `resume`: optional prompt that ' +
-        'starts your next turn after the compaction (omit to wait for the user). Each field ' +
+        'starts your next turn after the compaction (omit to wait for the user)' +
+        (cfg.resumeSkip
+          ? '; if another message starts that turn first, act on the next step there: the ' +
+            `prompt then follows only if that turn made fewer than ${cfg.resumeSkip} tool calls. `
+          : '. ') +
+        'Each field ' +
         `holds at most ${MAX_TEXT} characters (longer is refused, never cut: keep long state ` +
         'in a file and carry its path). Calling it again in the same turn replaces the ' +
         'request (fields left out are dropped); cancel_compaction cancels it (both work ' +
@@ -677,6 +780,7 @@ export const register: Register = (on, options) => {
       refused: 0,
     }
     lost = undefined
+    await dropResume($, 'a new request_compaction')
     const size = context ? `context ${kilo(context.tokens)} of ${kilo(context.window)} tokens` : undefined
     const extras = [pending.carry && 'carry', pending.resume && 'resume'].filter(Boolean).join(', ')
     await log($, `${replaced ? 'replaced' : 'scheduled'} for end of turn${extras ? ` (+ ${extras})` : ''}${size ? `; ${size}` : ''}`)
@@ -709,7 +813,14 @@ export const register: Register = (on, options) => {
       return { result: SUBAGENT_REFUSAL }
     }
     if (running) return { result: 'Too late: the compaction is already running.' }
-    if (!pending) return { result: 'Nothing to cancel: no compaction is scheduled.' }
+    const held = await dropResume($, 'cancel_compaction')
+    if (!pending) {
+      return {
+        result: held
+          ? 'No compaction is scheduled; the resume prompt of the last one is dropped.'
+          : 'Nothing to cancel: no compaction is scheduled.',
+      }
+    }
     pending = undefined
     await log($, 'cancelled')
     return { result: 'Compaction cancelled.' }
@@ -720,7 +831,10 @@ export const register: Register = (on, options) => {
   // so that the turn ends and the compaction runs before the context fills up.
   on('tool.call', async ($, e, next) => {
     const input = e as unknown as { tool: string; agentId?: string }
-    if (typeof input.agentId === 'string' || input.tool === FULL || input.tool === CANCEL_FULL) return next(e)
+    if (typeof input.agentId === 'string') return next(e)
+    // The main loop's work since the compaction decides whether a held resume prompt is still needed.
+    if (resume) resume.calls++
+    if (input.tool === FULL || input.tool === CANCEL_FULL) return next(e)
     if (!pending || running || allowed(input.tool)) {
       // With no request waiting: the remindAtTokens note, beside the first result of a turn.
       const res = await next(e)
@@ -787,6 +901,20 @@ export const register: Register = (on, options) => {
   // request gets the short note, a prompt that starts a turn before the
   // compaction the long one), or that its last request was dropped.
   on('prompt.submit', async ($, e, next) => {
+    // Our own resume prompt, where the host runs this hook only once the session is
+    // idle: withhold it if it was dropped or the main loop already did the work.
+    for (const r of [stale, resume]) {
+      if (!r?.sent || e.origin?.kind !== 'plugin' || e.text !== r.text + RESUME_NOTE) continue
+      if (r === stale) {
+        stale = undefined
+        return { drop: 'self-compact: resume prompt dropped (a newer request or a cancel replaced it)' }
+      }
+      if (cfg.resumeSkip && r.calls >= cfg.resumeSkip) {
+        resume = undefined
+        await log($, `resume prompt dropped: ${r.calls} tool calls since the compaction`)
+        return { drop: `self-compact: resume prompt dropped (${r.calls} tool calls since the compaction)` }
+      }
+    }
     const notes: string[] = []
     if (lost && !pending && !running) {
       notes.push(lostNote(lost))
@@ -813,7 +941,14 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => next(e))
 
   on('turn.start', ($, e, next) => {
+    // The main loop alone. A sub-agent's turn also starts here, and its end is not the
+    // main loop's: noted as the open turn it would defer a compaction for nothing.
+    if (e.agentId !== undefined) return next(e)
     openTurn = e.turnId
+    // A turn that starts before the held resume prompt was sent decides it when it ends.
+    // Main-loop turns do not overlap: if an earlier one is still noted here, its end was
+    // never reported, and this turn's end decides (the tool calls of both count).
+    if (resume && !resume.sent) resume.turn = e.turnId
     // The prompt that got the note while the session was idle started this turn.
     if (pending?.noted === IDLE) pending.noted = e.turnId
     if (reminded === IDLE) reminded = e.turnId
@@ -823,6 +958,12 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined && openTurn === e.turnId) openTurn = undefined
     const done = await next(e)
+    // The end of the turn a prompt is held for decides it. The end of an earlier turn
+    // that arrives after the next one started does not: that turn is running now and may
+    // do the work. (An end that is never reported is what watchResume is for.)
+    if (e.agentId === undefined && resume && !resume.sent && resume.turn === e.turnId) {
+      await decideResume($, resume).catch(err => log($, `resume decision failed: ${String(err).slice(0, 300)}`, true))
+    }
     if (e.agentId !== undefined || running) return done
     if (!pending) {
       await autoCompact($, e).catch(err => log($, `own compaction check failed: ${String(err).slice(0, 300)}`, true))
@@ -840,5 +981,10 @@ export const register: Register = (on, options) => {
     if (scheduled === pending) return done
     start($, pending, e.turnId)
     return done
+  })
+
+  on('session.end', async ($, e, next) => {
+    await dropResume($, `the session ended (${e.reason})`).catch(() => {})
+    return next(e)
   })
 }

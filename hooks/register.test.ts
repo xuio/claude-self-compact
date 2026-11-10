@@ -5,6 +5,7 @@ const TOOL = 'mcp__self-compact__request_compaction'
 const CANCEL = 'mcp__self-compact__cancel_compaction'
 const WORK = 'mcp__lab__run' // any other tool the agent might call
 const NOTES = 'mcp__notes__write'
+const SETTLE_MS = 1500 // the resume prompt waits this long for another turn to start first
 const summary: SessionMessage = { role: 'user', text: 'SUMMARY', toolUses: [] }
 
 // Beneath the plugin: a store, HOME, a log file kept in memory, the context size
@@ -205,6 +206,7 @@ test('a deferred request runs when the other turn ends, then resumes', async ($,
   await $.turn.complete(ended('T2'))
   await seen.clock.settle()
   expect(seen.compacts).toBe(1)
+  await seen.clock.advance(SETTLE_MS) // the resume prompt waits briefly for another turn
   expect(seen.prompts.map(p => p.text.split('\n')[0])).toEqual(['queued-test', 'go on'])
 })
 
@@ -492,7 +494,7 @@ test('an agent that will not end its turn has it ended, and the compaction runs'
   expect(seen.aborted).toEqual(['T1'])
   expect(seen.ran).toEqual([])
   await $.turn.complete({ turnId: 'T1', reason: 'aborted', isAborted: true, answer: '', durationMs: 1 } as never)
-  await seen.clock.settle()
+  await seen.clock.advance(SETTLE_MS)
   expect(seen.compacts).toBe(1)
   expect(seen.prompts.map(p => p.text.split('\n')[0])).toEqual(['go on'])
 })
@@ -801,4 +803,305 @@ test('instructionsFile: the tool description says that instructions can be left 
   const mine = described.find(d => d.startsWith('Compact your own context')) ?? ''
   expect(mine).toContain('An instructions file is configured (docs/compact.md)')
   expect(mine).toContain('leave `instructions` out')
+})
+
+// The resume prompt after a compaction: a message queued during the compaction can
+// start the next turn first (seen in use). The prompt is held back briefly; if
+// another main-loop turn starts, that turn's tool calls decide whether it still comes.
+const modLog = (seen: ReturnType<typeof world>) => seen.files['/nonexistent-home/.claude/self-compact/mod.log'] ?? ''
+const firstLines = (seen: ReturnType<typeof world>) => seen.prompts.map(p => p.text.split('\n')[0])
+
+async function compactWithResume($: Parameters<TestBody>[0], seen: ReturnType<typeof world>, resume = 'Port the parser') {
+  await $.turn.start({ turnId: 'T1', text: 'work' })
+  await $.tool.call({ tool: TOOL, carry: 'ids', resume } as never)
+  await $.turn.complete(ended('T1'))
+  await seen.clock.settle()
+  expect(seen.compacts).toBeGreaterThan(0)
+}
+
+test('resume (a): with no other turn the prompt is sent after a short wait', async ($, on) => {
+  const seen = world(on)
+  await compactWithResume($, seen)
+  expect(seen.prompts).toEqual([])
+  await seen.clock.advance(SETTLE_MS)
+  expect(firstLines(seen)).toEqual(['Port the parser'])
+  expect(seen.prompts[0]?.text).toContain('Skip what you already did.')
+  expect(seen.appended.join()).toContain('act on it in the next turn, together with whatever message starts that turn')
+})
+
+test('resume (b): another turn that makes 10 tool calls drops the prompt for good', async ($, on) => {
+  const seen = world(on)
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  for (let i = 0; i < 10; i++) await $.tool.call({ tool: WORK } as never)
+  await seen.clock.advance(SETTLE_MS)
+  expect(seen.prompts).toEqual([])
+  await $.turn.complete(ended('T2'))
+  await seen.clock.advance(60_000)
+  expect(seen.prompts).toEqual([])
+  expect(modLog(seen)).toContain('resume prompt dropped: 10 tool calls since the compaction')
+})
+
+// The default is above what orienting after a compaction takes (the playbook's own list
+// is about seven calls): a turn that only did that has not done the next step.
+test('resume (c): another turn with fewer tool calls gets the prompt when it ends', async ($, on) => {
+  const seen = world(on)
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  for (let i = 0; i < 9; i++) await $.tool.call({ tool: WORK } as never)
+  await seen.clock.advance(SETTLE_MS)
+  expect(seen.prompts).toEqual([])
+  await $.turn.complete(ended('T2'))
+  await seen.clock.settle()
+  expect(firstLines(seen)).toEqual(['Port the parser'])
+  expect(seen.prompts[0]?.text).toContain('(Queued when the compaction finished')
+})
+
+test('resume (d): resumeSkipAfterToolCalls 0 queues the prompt at once and never drops it', { options: { resumeSkipAfterToolCalls: 0 } }, async ($, on) => {
+  const seen = world(on)
+  await compactWithResume($, seen)
+  expect(firstLines(seen)).toEqual(['Port the parser'])
+  expect(seen.appended.join()).toContain('it is also queued as a prompt')
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  for (let i = 0; i < 5; i++) await $.tool.call({ tool: WORK } as never)
+  await $.turn.complete(ended('T2'))
+  await seen.clock.advance(60_000)
+  expect(seen.prompts.length).toBe(1)
+  expect(modLog(seen)).not.toContain('dropped')
+})
+
+test('resume (d): the threshold is the option; the tool description names it', { options: { resumeSkipAfterToolCalls: 3 } }, async ($, on) => {
+  const seen = world(on)
+  const described: string[] = []
+  on('tool.register', ($, e) => {
+    described.push(String((e as { description?: string }).description))
+    return { value: undefined } as never
+  })
+  on('session.start', () => ({ cwd: '/proj' }))
+  await $.session.start({ cwd: '/proj', surface: null, isInteractive: false } as never)
+  expect(described.find(d => d.startsWith('Compact your own context'))).toContain('fewer than 3 tool calls')
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  for (let i = 0; i < 3; i++) await $.tool.call({ tool: WORK } as never)
+  await $.turn.complete(ended('T2'))
+  await seen.clock.advance(60_000)
+  expect(seen.prompts).toEqual([])
+  expect(modLog(seen)).toContain('resume prompt dropped: 3 tool calls since the compaction')
+})
+
+test('resume (e): sub-agent tool calls do not count', async ($, on) => {
+  const seen = world(on)
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'agent message' })
+  for (let i = 0; i < 8; i++) await $.tool.call({ tool: WORK, agentId: 'A1' } as never)
+  await $.tool.call({ tool: WORK } as never)
+  await $.turn.complete(ended('T2'))
+  await seen.clock.settle()
+  expect(firstLines(seen)).toEqual(['Port the parser'])
+})
+
+test('resume (f): a new request drops the held prompt; the new one brings its own', async ($, on) => {
+  const seen = world(on)
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  await $.tool.call({ tool: TOOL, carry: 'ids', resume: 'Write the tests' } as never)
+  await $.turn.complete(ended('T2'))
+  await seen.clock.settle()
+  expect(seen.compacts).toBe(2)
+  await seen.clock.advance(60_000)
+  expect(firstLines(seen)).toEqual(['Write the tests'])
+  expect(modLog(seen)).toContain('resume prompt dropped: a new request_compaction')
+})
+
+test('resume (f): cancel_compaction drops the held prompt', async ($, on) => {
+  const seen = world(on)
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  const res = await $.tool.call({ tool: CANCEL } as never)
+  expect(JSON.stringify(res)).toContain('the resume prompt of the last one is dropped')
+  await $.turn.complete(ended('T2'))
+  await seen.clock.advance(60_000)
+  expect(seen.prompts).toEqual([])
+})
+
+test('resume (f): the session ending drops the held prompt', async ($, on) => {
+  const seen = world(on)
+  on('session.end', () => ({ sessionId: 'S1' }))
+  await compactWithResume($, seen)
+  await $.session.end({ reason: 'other' } as never)
+  await seen.clock.advance(60_000)
+  expect(seen.prompts).toEqual([])
+  expect(modLog(seen)).toContain('resume prompt dropped: the session ended')
+})
+
+test('resume: a turn whose end is never reported hands the decision to the next turn', async ($, on) => {
+  const seen = world(on)
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  for (let i = 0; i < 4; i++) await $.tool.call({ tool: WORK } as never)
+  await $.turn.start({ turnId: 'T3', text: 'agent message' })
+  for (let i = 0; i < 6; i++) await $.tool.call({ tool: WORK } as never)
+  await seen.clock.advance(SETTLE_MS)
+  expect(seen.prompts).toEqual([])
+  await $.turn.complete(ended('T3'))
+  await seen.clock.advance(60_000)
+  expect(seen.prompts).toEqual([])
+  expect(modLog(seen)).toContain('resume prompt dropped: 10 tool calls since the compaction')
+})
+
+const STALL_MS = 10 * 60_000
+
+test('resume: a turn that never reports its end does not hold the prompt for good', async ($, on) => {
+  const seen = world(on)
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  await $.tool.call({ tool: WORK } as never)
+  await seen.clock.advance(SETTLE_MS)
+  // Still working: a tool call in every window keeps the prompt held.
+  await seen.clock.advance(STALL_MS - 1000)
+  await $.tool.call({ tool: WORK } as never)
+  await seen.clock.advance(STALL_MS)
+  expect(seen.prompts).toEqual([])
+  // A whole window without one: decided as at a turn's end.
+  await seen.clock.advance(STALL_MS)
+  expect(firstLines(seen)).toEqual(['Port the parser'])
+  expect(modLog(seen)).toContain('resume prompt queued: turn T2 made no tool call for 10 min, its end was not reported, after 2 tool calls')
+})
+
+test('resume: with the work done, such a turn drops the prompt', async ($, on) => {
+  const seen = world(on)
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  for (let i = 0; i < 10; i++) await $.tool.call({ tool: WORK } as never)
+  await seen.clock.advance(SETTLE_MS)
+  await seen.clock.advance(STALL_MS)
+  expect(seen.prompts).toEqual([])
+  expect(modLog(seen)).toContain('resume prompt dropped: 10 tool calls since the compaction')
+  // Nothing is left for a later turn's end to decide.
+  await $.turn.complete(ended('T2'))
+  await seen.clock.advance(STALL_MS)
+  expect(seen.prompts).toEqual([])
+})
+
+// The end of an earlier turn can arrive after the next turn started. It must not decide:
+// the turn that runs now may do the work, or replace the prompt.
+test("resume: a late end of an earlier turn leaves the decision to the running turn", async ($, on) => {
+  const seen = world(on)
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  await $.tool.call({ tool: WORK } as never)
+  await seen.clock.advance(SETTLE_MS)
+  await $.turn.start({ turnId: 'T3', text: 'agent message' })
+  await $.turn.complete(ended('T2'))
+  await seen.clock.settle()
+  expect(seen.prompts).toEqual([])
+  await $.turn.complete(ended('T3'))
+  await seen.clock.settle()
+  expect(firstLines(seen)).toEqual(['Port the parser'])
+  expect(modLog(seen)).toContain('resume prompt queued: turn T3 ended after 1 tool calls')
+})
+
+test('resume: a new request while an earlier turn\'s end is handled drops the prompt, and it is not sent', async ($, on) => {
+  const seen = world(on)
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  await $.tool.call({ tool: WORK } as never)
+  await seen.clock.advance(SETTLE_MS)
+  const late = $.turn.complete(ended('T2'))
+  await $.turn.start({ turnId: 'T3', text: 'agent message' })
+  await $.tool.call({ tool: TOOL, carry: 'new' } as never)
+  await late
+  await seen.clock.settle()
+  expect(seen.prompts).toEqual([])
+  expect(modLog(seen)).toContain('resume prompt dropped: a new request_compaction')
+})
+
+test("resume: the turn's end and the look after ten minutes together send the prompt once", async ($, on) => {
+  const seen = world(on)
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  await $.tool.call({ tool: WORK } as never)
+  await seen.clock.advance(SETTLE_MS)
+  await seen.clock.advance(STALL_MS - 1)
+  const end = $.turn.complete(ended('T2'))
+  await seen.clock.advance(1)
+  await end
+  await seen.clock.settle()
+  expect(seen.prompts.length).toBe(1)
+  await seen.clock.advance(STALL_MS * 3)
+  expect(seen.prompts.length).toBe(1)
+})
+
+// A sub-agent's turn raises turn.start too (seen in the plugin's log: a compaction waited
+// for a "turn" whose end the main loop never reports).
+test("a sub-agent's turn neither defers the compaction nor decides the resume prompt", async ($, on) => {
+  const seen = world(on)
+  await $.turn.start({ turnId: 'T1', text: 'work' })
+  await $.tool.call({ tool: TOOL, carry: 'ids', resume: 'Port the parser' } as never)
+  await $.turn.start({ turnId: 'A1-1', text: 'review this', agentId: 'A1' } as never)
+  await $.turn.complete(ended('T1'))
+  await seen.clock.settle()
+  expect(seen.compacts).toBe(1)
+  expect(modLog(seen)).not.toContain('deferred')
+  await $.turn.start({ turnId: 'A1-2', text: 'go on', agentId: 'A1' } as never)
+  await seen.clock.advance(SETTLE_MS)
+  expect(firstLines(seen)).toEqual(['Port the parser'])
+})
+
+// Where a host runs the plugin's prompt.submit hook again as its own prompt is about to
+// start, the hook can still withhold it. The tests ask the way such a host would.
+const NOTE = '\n\n(Queued when the compaction finished; the same text is in the carry block. Skip what you already did.)'
+const asHost = ($: Parameters<TestBody>[0], text: string) =>
+  $.prompt.submit({ text: text + NOTE, origin: { kind: 'plugin' } } as never)
+
+test('resume: a sent prompt is withheld if the work was done before its turn starts', async ($, on) => {
+  const seen = world(on)
+  seen.hold = true // the prompt is sent and waits for an idle session
+  await compactWithResume($, seen)
+  await seen.clock.advance(SETTLE_MS)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  for (let i = 0; i < 10; i++) await $.tool.call({ tool: WORK } as never)
+  await $.turn.complete(ended('T2'))
+  seen.hold = false
+  expect(JSON.stringify(await asHost($, 'Port the parser'))).toContain('resume prompt dropped (10 tool calls since the compaction)')
+  expect(seen.prompts).toEqual([])
+})
+
+test('resume: a dropped prompt does not take a later one with the same text with it', async ($, on) => {
+  const seen = world(on)
+  seen.hold = true
+  await compactWithResume($, seen)
+  await seen.clock.advance(SETTLE_MS) // sent, and its turn never starts
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  await $.tool.call({ tool: TOOL, carry: 'ids', resume: 'Port the parser' } as never)
+  await $.turn.complete(ended('T2'))
+  await seen.clock.settle()
+  expect(seen.compacts).toBe(2)
+  await seen.clock.advance(SETTLE_MS) // the second prompt, same text, is sent
+  seen.hold = false
+  expect(JSON.stringify(await asHost($, 'Port the parser'))).not.toContain('dropped')
+  expect(firstLines(seen)).toEqual(['Port the parser'])
+})
+
+// Sent at a turn's end (not after the short wait) and then replaced: withheld the same way.
+test("resume: a prompt sent at a turn's end is withheld when a new request replaces it", async ($, on) => {
+  const seen = world(on)
+  seen.hold = true
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  await $.tool.call({ tool: WORK } as never)
+  await seen.clock.advance(SETTLE_MS)
+  await $.turn.complete(ended('T2')) // decided: sent, and its turn never starts
+  expect(modLog(seen)).toContain('resume prompt queued: turn T2 ended after 1 tool calls')
+  await $.turn.start({ turnId: 'T3', text: 'agent message' })
+  await $.tool.call({ tool: TOOL, carry: 'new' } as never)
+  seen.hold = false
+  expect(JSON.stringify(await asHost($, 'Port the parser'))).toContain('a newer request or a cancel replaced it')
+  expect(seen.prompts).toEqual([])
+})
+
+test('the carry block says it wins over the summary', { options: { alwaysCarry: 'Re-read HANDOFF.md' } }, async ($, on) => {
+  world(on)
+  const res = await $.session.compact({ trigger: 'manual', messages: [hello] })
+  expect(res.messages?.at(-1)?.text).toContain('Where the summary above and this block disagree, this block is right')
 })
