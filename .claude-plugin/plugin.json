@@ -1,6 +1,6 @@
 {
   "name": "self-compact",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Lets Claude compact its own context (a real /compact: the chat history stays visible), carry text verbatim across it and resume itself",
   "author": {
     "name": "Moritz Hoffmann",
@@ -17,6 +17,12 @@
       "type": "string",
       "title": "Always carry (verbatim after the summary)",
       "description": "Placed verbatim after the summary on every self-compaction (and on other compactions where this plugin's compaction hook runs), e.g. 'Re-read docs/HANDOFF.md before continuing.'",
+      "default": ""
+    },
+    "instructionsFile": {
+      "type": "string",
+      "title": "Instructions file (summary instructions)",
+      "description": "A file whose text is added to the summary instructions of every compaction this plugin starts or sees, after 'Always keep'. Absolute, under ~/, or relative to the project folder; read fresh at each compaction, first 8,000 characters. With it set, Claude can leave 'instructions' out of its requests.",
       "default": ""
     },
     "blockToolsAfterRequest": {
@@ -53,6 +59,18 @@
       "type": "number",
       "title": "Minimum minutes between self-compactions",
       "description": "The tool refuses a new request within this many minutes of the last self-compaction in the same session. 0 = off (the default; it was 10 before 0.4).",
+      "default": 0
+    },
+    "remindAtTokens": {
+      "type": "number",
+      "title": "Remind Claude to compact from this context size, in tokens",
+      "description": "From this context size on, a one-line note asks the main agent to finish the step in hand and call request_compaction: once per turn (beside a tool result, or the prompt that starts the turn), and again within a long turn after every 20,000 tokens of growth. Only where the host reports the size. 0 = off (the default).",
+      "default": 0
+    },
+    "autoCompactAtTokens": {
+      "type": "number",
+      "title": "Compact by itself from this context size, in tokens",
+      "description": "A safety net: when a turn of the main agent ends normally with no request waiting and the context is at least this size, the plugin compacts by itself (fixed instructions and 'Always carry' only; no next step is carried, no resume). At most once per 10 minutes. Set it below the host's automatic compaction. 0 = off (the default).",
       "default": 0
     }
   },

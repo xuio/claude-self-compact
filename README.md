@@ -39,7 +39,7 @@ The same plugin is also shipped in the
 [multi-agent playbook](https://github.com/xuio/claude-code-multi-agent-playbook/tree/main/plugins/self-compact)
 repository. Install it from one place only: both copies register the same tools.
 
-Requires a Claude Code build with the plugin mods API (function hooks). Version 0.5.1 passes
+Requires a Claude Code build with the plugin mods API (function hooks). Version 0.6.0 passes
 `claude plugin test` on 2.1.301 and type-checks against the 2.1.321 API. The API is early
 access and may change between releases.
 
@@ -121,6 +121,43 @@ off: the calls run, and Claude only reads a reminder beside each result.
 Tell Claude to make `request_compaction` the only tool call of its message. A call issued in
 the same message but run after it is refused like any other.
 
+## When Claude never asks
+
+The plugin acts when Claude asks. An agent that never asks runs into the host's automatic
+compaction in the middle of a task, with nothing carried. Two options cover that case; both
+are off by default and both need a host that reports the context size (where it does not,
+they do nothing).
+
+- **`remindAtTokens`**: from this size on, Claude reads a firm one-line note once per turn,
+  beside a tool result or beside the prompt that starts the turn: the context is past the
+  reminder point, finish the step in hand and call `request_compaction` as the last action of
+  the turn. In a long turn the note comes again each time the context has grown by another
+  20k tokens, in firmer words: write state to files now, request the compaction and end the
+  turn. With `autoCompactAtTokens` set, the note also says from which size the plugin compacts
+  by itself, and past that size that it will do so when the turn ends. Sub-agents never get
+  it, and nothing is added while a request waits.
+- **`autoCompactAtTokens`**: when a turn of the main agent ends normally, no request waits and
+  the context is at or above this size, the plugin runs the same compaction a request would
+  run. The instructions are `alwaysInstructions` and the instructions file; after the summary
+  come `alwaysCarry` and a standard note that the plugin started this compaction by itself at N
+  tokens, that no next step was carried, and to re-read the state or notes files before acting.
+  There is no resume prompt.
+
+An example pair for a 200k window whose automatic compaction fires near its end:
+`remindAtTokens: 130000` and `autoCompactAtTokens: 160000`. Leave room between the two, so that
+Claude gets a turn or two to request a compaction with a real carry first.
+
+The own compaction is a **safety net, not a handover**: it carries no next step and no resume,
+only what the options and the files hold. Guards keep it from looping. It does not run after a
+turn the person stopped or that ended with an error, at most once per 10 minutes per session
+(an attempt that failed or that another plugin's hook skipped counts), and not on a sub-agent's
+turn. If a turn starts before it could run, it is dropped, and that
+turn's end decides again. If it left the context at or above the threshold, it waits until the
+context has been below the threshold once, and logs that once. Where the host does not report
+the size after a compaction (the `/compact` path), the next turn's size decides. It is
+recorded in the history like any self-compaction, but `burstLimit`, `minIntervalMinutes` and
+`minContextTokens` never refuse it.
+
 ## Options
 
 Set with `/config` (or `pluginConfigs` in `settings.json`):
@@ -129,12 +166,35 @@ Set with `/config` (or `pluginConfigs` in `settings.json`):
 | --- | --- | --- |
 | `alwaysInstructions` | empty | Added to the summarizer's instructions on every self-compaction. |
 | `alwaysCarry` | empty | Placed verbatim after the summary on every self-compaction, e.g. `Re-read docs/HANDOFF.md before continuing.` |
+| `instructionsFile` | empty | A file whose text is added to the summary instructions, after `alwaysInstructions`. See "The instructions file" below. |
+| `remindAtTokens` | 0 | From this context size on, remind the main agent to request a compaction: once per turn, and again after every 20k tokens of growth within a turn. 0 = off. |
+| `autoCompactAtTokens` | 0 | From this context size on, compact by itself at the end of a turn when no request waits. 0 = off. |
 | `blockToolsAfterRequest` | true | While a request waits, refuse the main agent's other tool calls. `false`: only remind. |
 | `allowAfterRequest` | empty | Tool names, separated by commas, that stay allowed while a request waits. A trailing `*` matches a prefix: `SendMessage, mcp__notes__*`. |
 | `burstLimit` | 0 | Most self-compactions per window in one session. 0 = no limit. |
 | `burstWindowMinutes` | 30 | The window `burstLimit` counts over. |
 | `minContextTokens` | 0 | Smallest context worth compacting. 0 = no check. |
 | `minIntervalMinutes` | 0 | Fixed minimum time between two self-compactions. 0 = off. |
+
+### The instructions file
+
+`instructionsFile` takes a path that is absolute, starts with `~/`, or is relative to the
+session's project folder (`$.session.root()`; where the host gives none, the environment
+variable `CLAUDE_PROJECT_DIR`). The plugin reads the file fresh at each compaction, so edits
+count from the next one. Its text (the first 8,000 characters; a longer file is logged) goes
+into the summary instructions wherever `alwaysInstructions` goes, on requested and on the
+plugin's own compactions. The order is: the request's `instructions`, then
+`alwaysInstructions`, then the file.
+
+With a file set, Claude can leave `instructions` out of its requests; the tool's description
+tells it so, and the tool's answer names what will be used, for example
+`instructions: yours (80 chars) + file docs/compact.md (1200 chars)` (the path as resolved).
+A missing, empty or unreadable file does not stop the compaction: it goes ahead without the
+file, and the log says so once per session.
+
+A relative path is looked up in whichever project the session runs in, so each project
+supplies its own file, and a project you do not trust can supply one too. Give an absolute
+or `~/` path when the same text should apply everywhere.
 
 ### Where the two "always" options do not reach
 
@@ -156,7 +216,7 @@ folder.
    - `$.session.compact()` where the host allows it between turns (interactive terminal);
    - otherwise (SDK hosts such as the desktop app) `$.command.run({ command: 'compact' })`,
      exactly what typing `/compact` does.
-   `alwaysInstructions` is added to the instructions on both paths.
+   `alwaysInstructions` and the instructions file are added to the instructions on both paths.
 3. The carried text (`alwaysCarry`, `carry`, and the `resume` text) is appended after the
    summary: by the `session.compact` hook where it sees the compaction, otherwise with
    `$.session.append` right after it. Either way it lands once.
@@ -183,6 +243,12 @@ session are written in order, but two sessions logging at the same moment can lo
 The log is a debugging aid, not a record.
 
 ## Changes since 0.3.2
+
+**0.6.0: for an agent that never asks.** Three new options, all off by default:
+`remindAtTokens` reminds the main agent to request a compaction, `autoCompactAtTokens` lets the
+plugin compact by itself as a safety net, and `instructionsFile` keeps the fixed summary
+instructions in a file, so they need not be pasted into every request (see "When Claude never
+asks" and "The instructions file").
 
 **0.5.1: no limits by default.** `burstLimit` and `minContextTokens` now default to 0 (off);
 0.4.0 and 0.5.0 shipped them as 3 per 30 minutes and 40,000 tokens. Set them in the options if
@@ -215,9 +281,10 @@ often did not.
   vanished without a word; Claude could believe its context had been compacted.
 - **Log lines carry the session id**, and one session's lines no longer overwrite each other.
 
-All of this is covered by the tests in `hooks/register.test.ts` (36 tests). At the time of
-writing they had not yet run in a long live session; ending a turn from the plugin in
-particular has only run in the test engine.
+All of this is covered by the tests in `hooks/register.test.ts` (54 tests). At the time of
+writing they had not yet run in a long live session; ending a turn from the plugin, the
+reminder, the plugin's own compaction and the instructions file in particular have only run in
+the test engine.
 
 ## Develop
 

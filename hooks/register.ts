@@ -50,6 +50,19 @@ import type { EngineInterface as Engine, Register, SessionMessage } from 'claude
 //     the request;
 //   - a turn that ends early (the person pressed Stop, an error) drops the request,
 //     and the model is told so beside the next prompt.
+//
+// For an agent that never asks (all three off unless the options set them):
+//   - remindAtTokens: from this context size on, a one-line note beside a tool
+//     result (and beside a prompt that starts a turn) asks the main agent to request
+//     a compaction at the end of the step in hand: once per turn, and again within
+//     a long turn each time the context has grown by REMIND_STEP;
+//   - autoCompactAtTokens: from this size on, the plugin compacts by itself when a
+//     main-loop turn ends normally and no request waits: the fixed instructions,
+//     alwaysCarry and a standard note after the summary, no resume. At most one per
+//     AUTO_GAP_MS, and not again while a compaction of its own left the context
+//     above the threshold, until the context has been below it once;
+//   - instructionsFile: a file whose text joins alwaysInstructions on every
+//     compaction the plugin starts or sees, read fresh each time.
 // Every decision is logged to ~/.claude/self-compact/mod.log with the session id.
 // Only failures show in the transcript; routine steps go to the debug log.
 
@@ -64,6 +77,9 @@ const MAX_REFUSALS = 6
 const LOG_KEEP = 400
 const HISTORY_KEEP = 20
 const LAST_KEY = 'lastAt'
+const AUTO_KEY = 'autoAt' // when this session last compacted by itself
+const AUTO_GAP_MS = 10 * 60_000
+const REMIND_STEP = 20_000 // within one turn the reminder comes again after this much growth
 const DAY_MS = 24 * 3600_000
 const IDLE = '(idle)'
 const FIELDS = ['instructions', 'carry', 'resume'] as const
@@ -79,10 +95,14 @@ type Job = {
   noted?: string    // the turn whose prompt last got the "still scheduled" note
   refused: number   // tool calls refused (or reminded) while this request waited
   forced?: boolean  // the plugin is ending the turn itself, so that the compaction can run
+  auto?: number     // an own compaction: the context size that started it
 }
 type Config = {
   alwaysInstructions?: string
   alwaysCarry?: string
+  instructionsFile?: string
+  remindAt: number
+  autoAt: number
   minIntervalMs: number
   burstLimit: number
   burstWindowMs: number
@@ -92,6 +112,8 @@ type Config = {
 }
 
 let cfg: Config = {
+  remindAt: 0,
+  autoAt: 0,
   minIntervalMs: 0,
   burstLimit: 0,
   burstWindowMs: 30 * 60_000,
@@ -104,6 +126,11 @@ let running: Job | undefined   // the compaction has started
 let scheduled: Job | undefined // a turn.complete callback is working on it
 let openTurn: string | undefined // the main loop's running turn (subagents raise no turn.start)
 let lost: string | undefined   // why the last request did not end in a compaction, until the model is told
+let reminded: string | undefined // the turn that got the remindAtTokens note (IDLE until its turn starts)
+let remindedAt = 0             // the context size that note named
+let autoUnmeasured = false     // an own compaction ran and its result size is not known yet
+let autoHeld = false           // an own compaction left the context above the threshold
+const warned = new Set<string>() // log lines written once per session
 let logTail: Promise<void> = Promise.resolve()
 
 const sameTurnNote = () =>
@@ -157,6 +184,31 @@ const SUBAGENT_REFUSAL =
   'and not yours. You are a sub-agent; nothing was scheduled or changed. If your own context ' +
   'is filling up, write your state to your notes file, report to the agent that started you ' +
   'and end your turn.'
+
+// Beside a tool result or a prompt, from remindAtTokens on: once per turn, and
+// `again` in the same turn after the context grew by REMIND_STEP.
+const remindNote = (tokens: number, again: boolean) =>
+  (again
+    ? `self-compact: your context has grown to ${kilo(tokens)} tokens and no compaction is ` +
+      `requested (reminder point ${kilo(cfg.remindAt)}). Write durable state to files now, then ` +
+      'call request_compaction with your carry and next step, and end the turn.'
+    : `self-compact: your context holds ${kilo(tokens)} tokens, past the reminder point of ` +
+      `${kilo(cfg.remindAt)}. Finish the step in hand, write durable state to files, and call ` +
+      'request_compaction as the last action of this turn.') +
+  (!cfg.autoAt
+    ? ''
+    : tokens >= cfg.autoAt
+      ? ` It is past ${kilo(cfg.autoAt)} tokens: when this turn ends the plugin compacts by ` +
+        'itself, without a carry from you, unless you request the compaction first.'
+      : ` From ${kilo(cfg.autoAt)} tokens the plugin compacts by itself at the end of a turn, ` +
+        'without a carry from you.')
+
+// Placed after the summary of an own compaction (after alwaysCarry).
+const autoNote = (tokens: number) =>
+  'The self-compact plugin started this compaction by itself, because the context reached ' +
+  `${kilo(tokens)} tokens (autoCompactAtTokens is ${kilo(cfg.autoAt)}). You had not requested ` +
+  'it, so no next step was carried. Before acting, re-read your state or notes files to find ' +
+  'where the work stands.'
 
 const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : undefined)
 
@@ -251,6 +303,83 @@ async function contextNow($: Engine) {
   }
 }
 
+// A line logged once per session (`key` tells two lines apart).
+async function logOnce($: Engine, key: string, line: string, loud = false) {
+  if (warned.has(key)) return
+  warned.add(key)
+  await log($, line, loud)
+}
+
+// Where instructionsFile lies: absolute, under HOME (~/), or under the project root.
+async function filePath($: Engine, given: string) {
+  if (given.startsWith('/') || /^[A-Za-z]:[\\/]/.test(given)) return given
+  if (given.startsWith('~/')) {
+    const home = await $.env.get('HOME').catch(() => undefined)
+    if (home) return `${home}/${given.slice(2)}`
+    await logOnce($, 'file-home', `instructionsFile ${given}: HOME is not set; compacting without the file`, true)
+    return undefined
+  }
+  const root =
+    (await $.session.root().catch(() => undefined)) ??
+    (await $.env.get('CLAUDE_PROJECT_DIR').catch(() => undefined))
+  if (root) return `${root.replace(/[\\/]+$/, '')}/${given}`
+  await logOnce($, 'file-root', `instructionsFile ${given} is relative and the project folder is unknown; compacting without the file`, true)
+  return undefined
+}
+
+// instructionsFile, read fresh: its path and text, or why it is left out.
+async function fileInstructions($: Engine): Promise<{ path: string; text?: string } | undefined> {
+  const given = cfg.instructionsFile
+  if (!given) return undefined
+  const path = await filePath($, given)
+  if (!path) return { path: given }
+  let text: string | undefined
+  try {
+    text = str(await $.fs.read(path))
+  } catch (err) {
+    await logOnce($, `file-read ${path}`, `instructionsFile ${path} is missing or unreadable (${String(err).slice(0, 200)}); compacting without it`, true)
+    return { path }
+  }
+  if (!text) {
+    await logOnce($, `file-empty ${path}`, `instructionsFile ${path} is empty; compacting without it`)
+    return { path }
+  }
+  if (text.length > MAX_TEXT) {
+    await logOnce($, `file-long ${path}`, `instructionsFile ${path} is ${text.length} characters; only the first ${MAX_TEXT} are used`, true)
+  }
+  return { path, text: text.slice(0, MAX_TEXT) }
+}
+
+// The instructions every compaction gets: alwaysInstructions, then the file.
+const fixedInstructions = async ($: Engine) => join(cfg.alwaysInstructions, (await fileInstructions($))?.text)
+
+// When this session last compacted by itself.
+async function lastAuto($: Engine) {
+  const all = ((await $.store.get(AUTO_KEY)) ?? {}) as Record<string, number>
+  return all[await $.session.id()]
+}
+
+async function markAuto($: Engine) {
+  const now = await $.clock.now()
+  const all = ((await $.store.get(AUTO_KEY)) ?? {}) as Record<string, number>
+  const kept = Object.fromEntries(Object.entries(all).filter(([, at]) => now - at < DAY_MS))
+  await $.store.set(AUTO_KEY, { ...kept, [await $.session.id()]: now })
+}
+
+// The remindAtTokens note for `turn`, or undefined: once per turn, and again in
+// the same turn each time the context has grown by REMIND_STEP since the last note.
+async function reminder($: Engine, turn: string) {
+  if (!cfg.remindAt) return undefined
+  const context = await contextNow($)
+  if (!context || context.tokens < cfg.remindAt) return undefined
+  const again = reminded === turn
+  if (again && context.tokens < remindedAt + REMIND_STEP) return undefined
+  reminded = turn
+  remindedAt = context.tokens
+  await log($, `reminded${again ? ' again' : ''}: context ${context.tokens} tokens, remindAtTokens ${cfg.remindAt} (turn ${turn})`)
+  return remindNote(context.tokens, again)
+}
+
 // What the job carries after the summary: its carry, then its resume text.
 const jobCarry = (job: Job) =>
   join(
@@ -284,7 +413,13 @@ async function finish($: Engine, job: Job, how: string) {
 
 // Whether `job` must not run now: cancelled or replaced, or another turn started
 // first (then it stays pending and that turn's turn.complete runs it).
+// An own compaction is dropped instead: that turn's end decides again.
 async function superseded($: Engine, job: Job) {
+  if (job.auto !== undefined) {
+    if (openTurn === undefined && pending === undefined) return false
+    await log($, `own compaction dropped: ${openTurn !== undefined ? `turn ${openTurn} started first` : 'a request came first'}`)
+    return true
+  }
   if (pending !== job) return true
   if (openTurn === undefined) return false
   await log($, `deferred: turn ${openTurn} started first; compacting when it ends`)
@@ -293,7 +428,10 @@ async function superseded($: Engine, job: Job) {
 
 // Compacts for `job` unless superseded.
 async function compact($: Engine, job: Job, turnId: string) {
-  await log($, `turn ${turnId} complete; compacting`)
+  const own = job.auto !== undefined ? 'own compaction ' : ''
+  await log($, `turn ${turnId} complete; compacting${own ? ' by itself' : ''}`)
+  // Read once per compaction: the file's text as it stands now.
+  const fixed = await fixedInstructions($)
   let lastErr = ''
   let headless = false
   for (let i = 0; i < RETRIES && !headless; i++) {
@@ -302,16 +440,18 @@ async function compact($: Engine, job: Job, turnId: string) {
     try {
       // This plugin's own session.compact hook does not see a compaction the
       // plugin starts, so the configured instructions go in here.
-      const instructions = join(job.instructions, cfg.alwaysInstructions)
+      const instructions = join(job.instructions, fixed)
       const res = await $.session.compact(instructions ? { instructions } : {})
-      pending = undefined
+      if (pending === job) pending = undefined
       if (res.skip !== undefined) {
-        lost = `a hook skipped it: ${res.skip}`
-        await log($, `skipped by a hook: ${res.skip}`)
+        if (!own) lost = `a hook skipped it: ${res.skip}`
+        else await markAuto($) // an attempt counts: no new one at every turn's end
+        await log($, `${own}skipped by a hook: ${res.skip}`)
         $.ui.toast(`Self-compaction skipped: ${res.skip}`)
         return
       }
-      await finish($, job, `session.compact after ${i} retries`)
+      await finish($, job, `${own}session.compact after ${i} retries`)
+      if (own) await afterAuto($, res.tokensAfter)
       return
     } catch (err) {
       running = undefined
@@ -331,21 +471,88 @@ async function compact($: Engine, job: Job, turnId: string) {
   // this compaction, so alwaysInstructions goes into the command's text here
   // (the hook skips text that is already there).
   running = job
-  pending = undefined
+  if (pending === job) pending = undefined
   try {
-    await $.command.run({ command: 'compact', args: join(job.instructions, cfg.alwaysInstructions) ?? '' })
-    await finish($, job, `/compact via command.run (${headless ? 'headless host' : 'retries exhausted'})`)
+    await $.command.run({ command: 'compact', args: join(job.instructions, fixed) ?? '' })
+    await finish($, job, `${own}/compact via command.run (${headless ? 'headless host' : 'retries exhausted'})`)
+    if (own) await afterAuto($, undefined)
   } catch (err) {
-    lost = 'the /compact command failed'
-    await log($, `/compact via command.run rejected: ${String(err).slice(0, 300)}`, true)
+    if (!own) lost = 'the /compact command failed'
+    else await markAuto($)
+    await log($, `${own}/compact via command.run rejected: ${String(err).slice(0, 300)}`, true)
     $.ui.toast('Self-compaction failed; see ~/.claude/self-compact/mod.log')
   }
+}
+
+// Runs the compaction for `job` outside the turn.complete hook: the session must
+// be idle for it to be accepted (Stop hooks of other plugins may keep it busy
+// after turn.complete).
+function start($: Engine, job: Job, turnId: string) {
+  scheduled = job
+  $.clock.after(0, async () => {
+    try {
+      await compact($, job, turnId)
+    } finally {
+      if (scheduled === job) scheduled = undefined
+      if (running === job) running = undefined
+    }
+  })
+}
+
+// After an own compaction: when its result is still at or above the threshold,
+// hold until the context has been below it once (no loop). Where the size after
+// it is not reported, the next measurement at a turn's end decides.
+async function afterAuto($: Engine, tokensAfter: number | undefined) {
+  await markAuto($)
+  autoUnmeasured = tokensAfter === undefined
+  if (tokensAfter !== undefined && tokensAfter >= cfg.autoAt) await holdAuto($, tokensAfter)
+}
+
+async function holdAuto($: Engine, tokens: number) {
+  autoHeld = true
+  await log($, `own compaction left the context at ${tokens} tokens, at or above autoCompactAtTokens ${cfg.autoAt}; no further own compaction until it has been below`, true)
+}
+
+// At the end of a main-loop turn with no request waiting: compact by itself when
+// the context is at or above autoCompactAtTokens. Not after a stopped or failed
+// turn, at most one per AUTO_GAP_MS, and not while held.
+async function autoCompact($: Engine, e: { turnId: string; reason: string; isAborted: boolean }) {
+  if (!cfg.autoAt || scheduled) return
+  const context = await contextNow($)
+  const unmeasured = autoUnmeasured
+  autoUnmeasured = false
+  if (!context) {
+    await logOnce($, 'auto-size', 'autoCompactAtTokens is set, but the host did not report the context size at the end of a turn; no own compaction then')
+    return
+  }
+  if (context.tokens < cfg.autoAt) {
+    if (autoHeld) await log($, `context ${context.tokens} tokens is below autoCompactAtTokens again; own compaction possible again`)
+    autoHeld = false
+    return
+  }
+  if (autoHeld) return
+  if (unmeasured) return holdAuto($, context.tokens)
+  if (e.isAborted || e.reason !== 'answer') {
+    await log($, `own compaction not started: context ${context.tokens} tokens, but turn ${e.turnId} ended with ${e.reason}`)
+    return
+  }
+  const now = await $.clock.now()
+  const last = await lastAuto($)
+  if (last !== undefined && now - last < AUTO_GAP_MS) {
+    await log($, `own compaction not started: context ${context.tokens} tokens, but the last one was ${span(now - last)} ago (at most one per ${AUTO_GAP_MS / 60_000} min)`)
+    return
+  }
+  await log($, `context ${context.tokens} tokens, at or above autoCompactAtTokens ${cfg.autoAt}, and no request: compacting by itself`)
+  start($, { auto: context.tokens, carry: autoNote(context.tokens), refused: 0 }, e.turnId)
 }
 
 export const register: Register = (on, options) => {
   cfg = {
     alwaysInstructions: str(options.alwaysInstructions)?.slice(0, MAX_TEXT),
     alwaysCarry: str(options.alwaysCarry)?.slice(0, MAX_TEXT),
+    instructionsFile: str(options.instructionsFile),
+    remindAt: num(options.remindAtTokens, 0),
+    autoAt: num(options.autoCompactAtTokens, 0),
     minIntervalMs: num(options.minIntervalMinutes, 0) * 60_000,
     burstLimit: Math.floor(num(options.burstLimit, 0)),
     burstWindowMs: num(options.burstWindowMinutes, 30) * 60_000,
@@ -384,6 +591,11 @@ export const register: Register = (on, options) => {
             'yours is refused until the compaction has run. '
           : '') +
         'Only the main agent can call it; a sub-agent is refused.' +
+        (cfg.instructionsFile
+          ? ` An instructions file is configured (${cfg.instructionsFile}); its text goes into the ` +
+            'summary instructions of every compaction, so leave `instructions` out unless this ' +
+            'compaction needs more.'
+          : '') +
         (limits ? ` Also refused ${limits}; the answer says why and when to retry.` : ''),
       inputSchema: {
         type: 'object',
@@ -468,8 +680,15 @@ export const register: Register = (on, options) => {
     const size = context ? `context ${kilo(context.tokens)} of ${kilo(context.window)} tokens` : undefined
     const extras = [pending.carry && 'carry', pending.resume && 'resume'].filter(Boolean).join(', ')
     await log($, `${replaced ? 'replaced' : 'scheduled'} for end of turn${extras ? ` (+ ${extras})` : ''}${size ? `; ${size}` : ''}`)
+    // What the summary instructions will be made of (the file as it reads now).
+    const file = await fileInstructions($)
+    const parts = [
+      pending.instructions && `yours (${pending.instructions.length} chars)`,
+      cfg.alwaysInstructions && `alwaysInstructions (${cfg.alwaysInstructions.length} chars)`,
+      file && (file.text ? `file ${file.path} (${file.text.length} chars)` : `file ${file.path} (missing, empty or unreadable now; left out)`),
+    ].filter(Boolean)
     const got = [
-      pending.instructions && `instructions ${pending.instructions.length} chars`,
+      parts.length && `instructions: ${parts.join(' + ')}`,
       pending.carry && `carry ${pending.carry.length} chars`,
       pending.resume ? `resume ${pending.resume.length} chars` : 'no resume: after it the session waits for the user',
       size,
@@ -501,7 +720,14 @@ export const register: Register = (on, options) => {
   // so that the turn ends and the compaction runs before the context fills up.
   on('tool.call', async ($, e, next) => {
     const input = e as unknown as { tool: string; agentId?: string }
-    if (!pending || running || typeof input.agentId === 'string' || allowed(input.tool)) return next(e)
+    if (typeof input.agentId === 'string' || input.tool === FULL || input.tool === CANCEL_FULL) return next(e)
+    if (!pending || running || allowed(input.tool)) {
+      // With no request waiting: the remindAtTokens note, beside the first result of a turn.
+      const res = await next(e)
+      if (pending || running || res.deny !== undefined) return res
+      const note = await reminder($, openTurn ?? IDLE).catch(() => undefined)
+      return note ? { ...res, context: [...(res.context ?? []), note] } : res
+    }
     const job = pending
     job.refused++
     if (cfg.blockTools && job.refused >= MAX_REFUSALS) {
@@ -544,7 +770,7 @@ export const register: Register = (on, options) => {
   on('session.compact', async ($, e, next) => {
     if (e.agentId !== undefined || e.trigger === 'precompute') return next(e)
     const job = running
-    const always = cfg.alwaysInstructions
+    const always = await fixedInstructions($).catch(() => cfg.alwaysInstructions)
     const instructions = always && !(e.instructions ?? '').includes(always) ? join(e.instructions, always) : e.instructions
     const res = await next(instructions === e.instructions ? e : { ...e, instructions })
     if (res.skip !== undefined) return res
@@ -578,6 +804,11 @@ export const register: Register = (on, options) => {
           : 'a prompt started a turn first; the request stays pending')
       }
     }
+    // A prompt that starts a turn: the remindAtTokens note (the turn's tool results then skip it).
+    if (!pending && !running && e.turnId === undefined && openTurn === undefined) {
+      const note = await reminder($, IDLE)
+      if (note) notes.push(note)
+    }
     return notes.length ? next({ ...e, context: [...(e.context ?? []), ...notes] }) : next(e)
   }).catch(($, e, next) => next(e))
 
@@ -585,13 +816,18 @@ export const register: Register = (on, options) => {
     openTurn = e.turnId
     // The prompt that got the note while the session was idle started this turn.
     if (pending?.noted === IDLE) pending.noted = e.turnId
+    if (reminded === IDLE) reminded = e.turnId
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined && openTurn === e.turnId) openTurn = undefined
     const done = await next(e)
-    if (e.agentId !== undefined || !pending || running) return done
+    if (e.agentId !== undefined || running) return done
+    if (!pending) {
+      await autoCompact($, e).catch(err => log($, `own compaction check failed: ${String(err).slice(0, 300)}`, true))
+      return done
+    }
     // A turn that ended early drops the request, unless the plugin ended it itself.
     if ((e.isAborted || e.reason !== 'answer') && !pending.forced) {
       pending = undefined
@@ -601,19 +837,8 @@ export const register: Register = (on, options) => {
       await log($, `dropped (turn ended: ${e.reason})`)
       return done
     }
-    const job = pending
-    if (scheduled === job) return done
-    scheduled = job
-    // Run outside this hook: the session must be idle for the compaction to be
-    // accepted (Stop hooks of other plugins may keep it busy after turn.complete).
-    $.clock.after(0, async () => {
-      try {
-        await compact($, job, e.turnId)
-      } finally {
-        if (scheduled === job) scheduled = undefined
-        if (running === job) running = undefined
-      }
-    })
+    if (scheduled === pending) return done
+    start($, pending, e.turnId)
     return done
   })
 }
