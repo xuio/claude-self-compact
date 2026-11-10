@@ -39,7 +39,7 @@ The same plugin is also shipped in the
 [multi-agent playbook](https://github.com/xuio/claude-code-multi-agent-playbook/tree/main/plugins/self-compact)
 repository. Install it from one place only: both copies register the same tools.
 
-Requires a Claude Code build with the plugin mods API (function hooks). Version 0.6.1 passes
+Requires a Claude Code build with the plugin mods API (function hooks). Version 0.6.2 passes
 `claude plugin test` on 2.1.301 and type-checks against the 2.1.321 API. The API is early
 access and may change between releases.
 
@@ -231,11 +231,14 @@ folder.
    not count) until that turn ends: at `resumeSkipAfterToolCalls` (default 10) or more the next
    step was done there and the prompt is dropped; with fewer (an answer to a notice, or only
    the orientation after the compaction) it is sent then, so an unattended agent does not sit
-   idle. The default is 10 because an orientation routine can take 7 or 8 calls by itself, and
+   idle. The default is 10 because an orientation routine can take 7 to 9 calls by itself, and
    a wrong drop leaves the agent idle, while a wrong send costs one turn. If the turn's end is
    never reported, the prompt is decided the same way when the plugin finds no tool call of the
    main agent in a 10-minute window, which is 10 to 20 minutes after the last one. A new request, `cancel_compaction` or the
-   session ending drops a held prompt. `resumeSkipAfterToolCalls: 0` sends it at once, as
+   session ending drops a held prompt. A prompt that was sent can wait behind another turn;
+   where the host asks the plugin again before it starts, the plugin withholds it if a request
+   or a cancel replaced it meanwhile, or if the main agent made `resumeSkipAfterToolCalls` or
+   more tool calls after it was sent. `resumeSkipAfterToolCalls: 0` sends it at once, as
    before 0.6.1.
 
 What Claude is told beside a prompt, each at most once per turn:
@@ -256,6 +259,12 @@ session are written in order, but two sessions logging at the same moment can lo
 The log is a debugging aid, not a record.
 
 ## Changes since 0.3.2
+
+**0.6.2: a prompt that was sent is not dropped for earlier tool calls.** A sent prompt can wait
+behind another turn. The plugin then counted every tool call since the compaction again: a
+turn of 9 calls, then one call in the next turn, dropped a prompt it had just decided to send,
+and the agent sat idle (found in review and reproduced in the test engine, not seen in use).
+Only the calls made after the prompt was sent count now.
 
 **0.6.1: no extra turn for the resume prompt.** When a queued message started the turn after a
 compaction, the agent did the next step there and the resume prompt then cost one more turn
@@ -302,7 +311,7 @@ often did not.
   vanished without a word; Claude could believe its context had been compacted.
 - **Log lines carry the session id**, and one session's lines no longer overwrite each other.
 
-All of this is covered by the tests in `hooks/register.test.ts` (74 tests). At the time of
+All of this is covered by the tests in `hooks/register.test.ts` (78 tests). At the time of
 writing they had not yet run in a long live session; ending a turn from the plugin, the
 reminder, the plugin's own compaction and the instructions file in particular have only run in
 the test engine.

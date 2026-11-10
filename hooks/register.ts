@@ -112,6 +112,7 @@ type Resume = {
   calls: number  // main-loop tool calls since the compaction
   turn?: string  // the main-loop turn that started before the prompt was sent
   sent?: boolean // submitted; waiting for its turn
+  sentAt?: number // `calls` when it was submitted
 }
 type Config = {
   alwaysInstructions?: string
@@ -417,7 +418,10 @@ const jobCarry = (job: Job) =>
 
 // Submits the resume prompt. Not awaited: it resolves only when its turn starts.
 function sendResume($: Engine, text: string, r?: Resume) {
-  if (r) r.sent = true
+  if (r) {
+    r.sent = true
+    r.sentAt = r.calls
+  }
   // The prompt.submit guard knows a prompt by its text only. A dropped prompt with the
   // same text must not take this one with it: rather one prompt too many than none.
   if (stale?.text === text) stale = undefined
@@ -902,17 +906,20 @@ export const register: Register = (on, options) => {
   // compaction the long one), or that its last request was dropped.
   on('prompt.submit', async ($, e, next) => {
     // Our own resume prompt, where the host runs this hook only once the session is
-    // idle: withhold it if it was dropped or the main loop already did the work.
+    // idle: withhold it if it was dropped, or if the main loop did the work after it was
+    // sent. The calls before the send do not count again: with those it was decided to
+    // send (a turn of 9 calls, then one call in the next turn, is not the work done).
     for (const r of [stale, resume]) {
       if (!r?.sent || e.origin?.kind !== 'plugin' || e.text !== r.text + RESUME_NOTE) continue
       if (r === stale) {
         stale = undefined
         return { drop: 'self-compact: resume prompt dropped (a newer request or a cancel replaced it)' }
       }
-      if (cfg.resumeSkip && r.calls >= cfg.resumeSkip) {
+      const since = r.calls - (r.sentAt ?? 0)
+      if (cfg.resumeSkip && since >= cfg.resumeSkip) {
         resume = undefined
-        await log($, `resume prompt dropped: ${r.calls} tool calls since the compaction`)
-        return { drop: `self-compact: resume prompt dropped (${r.calls} tool calls since the compaction)` }
+        await log($, `resume prompt dropped: ${since} tool calls after it was queued`)
+        return { drop: `self-compact: resume prompt dropped (${since} tool calls after it was queued)` }
       }
     }
     const notes: string[] = []

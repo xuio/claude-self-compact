@@ -31,6 +31,8 @@ function world(on: On, store: Record<string, unknown> = {}, live = false, env: R
     appended: [] as string[],
     files: {} as Record<string, string>,
     hold: false, // the plugin's own prompts wait (the session never goes idle)
+    gate: undefined as Promise<void> | undefined, // the next file write waits for this (a slow disk)
+    gated: undefined as string | undefined, // what that write was writing
     skip: undefined as string | undefined, // another plugin's hook skips every compaction
     tries: 0, // the compactions asked for, skipped ones included
     refuses: false, // the host refuses a compaction between turns (as the desktop app does)
@@ -90,7 +92,13 @@ function world(on: On, store: Record<string, unknown> = {}, live = false, env: R
   on('session.root', () => {
     return seen.root === undefined ? { deny: 'no project root' } : { value: seen.root }
   })
-  on('fs.write', ($, e) => {
+  on('fs.write', async ($, e) => {
+    const gate = seen.gate
+    if (gate) {
+      seen.gate = undefined
+      seen.gated = e.text
+      await gate
+    }
     seen.files[e.path] = e.text
     return { value: undefined }
   })
@@ -1063,7 +1071,7 @@ test('resume: a sent prompt is withheld if the work was done before its turn sta
   for (let i = 0; i < 10; i++) await $.tool.call({ tool: WORK } as never)
   await $.turn.complete(ended('T2'))
   seen.hold = false
-  expect(JSON.stringify(await asHost($, 'Port the parser'))).toContain('resume prompt dropped (10 tool calls since the compaction)')
+  expect(JSON.stringify(await asHost($, 'Port the parser'))).toContain('resume prompt dropped (10 tool calls after it was queued)')
   expect(seen.prompts).toEqual([])
 })
 
@@ -1095,6 +1103,95 @@ test("resume: a prompt sent at a turn's end is withheld when a new request repla
   expect(modLog(seen)).toContain('resume prompt queued: turn T2 ended after 1 tool calls')
   await $.turn.start({ turnId: 'T3', text: 'agent message' })
   await $.tool.call({ tool: TOOL, carry: 'new' } as never)
+  seen.hold = false
+  expect(JSON.stringify(await asHost($, 'Port the parser'))).toContain('a newer request or a cancel replaced it')
+  expect(seen.prompts).toEqual([])
+})
+
+// Sent at a turn's end after 9 calls: those calls were weighed then. A call in a turn that
+// starts before the prompt's own turn must not drop it after all (the agent would sit idle).
+test("resume: a prompt sent at a turn's end is not withheld for a call in a later turn", async ($, on) => {
+  const seen = world(on)
+  seen.hold = true
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  for (let i = 0; i < 9; i++) await $.tool.call({ tool: WORK } as never)
+  await seen.clock.advance(SETTLE_MS)
+  await $.turn.complete(ended('T2'))
+  expect(modLog(seen)).toContain('resume prompt queued: turn T2 ended after 9 tool calls')
+  await $.turn.start({ turnId: 'T3', text: 'task notification' })
+  await $.tool.call({ tool: WORK } as never)
+  await $.turn.complete(ended('T3'))
+  seen.hold = false
+  expect(JSON.stringify(await asHost($, 'Port the parser'))).not.toContain('dropped')
+  expect(firstLines(seen)).toEqual(['Port the parser'])
+})
+
+test("resume: a prompt sent at a turn's end is withheld when a later turn does the work", async ($, on) => {
+  const seen = world(on)
+  seen.hold = true
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  for (let i = 0; i < 9; i++) await $.tool.call({ tool: WORK } as never)
+  await seen.clock.advance(SETTLE_MS)
+  await $.turn.complete(ended('T2'))
+  await $.turn.start({ turnId: 'T3', text: 'agent message' })
+  for (let i = 0; i < 10; i++) await $.tool.call({ tool: WORK } as never)
+  await $.turn.complete(ended('T3'))
+  seen.hold = false
+  expect(JSON.stringify(await asHost($, 'Port the parser'))).toContain('resume prompt dropped (10 tool calls after it was queued)')
+  expect(seen.prompts).toEqual([])
+})
+
+// A log write takes time on a disk. A request that drops the prompt while the line about
+// sending it is being written must still find it sent (and mark it), not see it sent after.
+// The next file write waits until the returned function is called.
+function slowWrite(seen: ReturnType<typeof world>) {
+  let open = () => {}
+  seen.gate = new Promise<void>(resolve => (open = resolve))
+  return open
+}
+const droppedByRequest = (seen: ReturnType<typeof world>) =>
+  seen.logs.some(l => l.text.includes('resume prompt dropped: a new request_compaction'))
+
+test("resume: a request while the send at a turn's end is being logged still withholds the prompt", async ($, on) => {
+  const seen = world(on)
+  seen.hold = true
+  await compactWithResume($, seen)
+  await $.turn.start({ turnId: 'T2', text: 'task notification' })
+  await $.tool.call({ tool: WORK } as never)
+  await seen.clock.advance(SETTLE_MS)
+  const open = slowWrite(seen)
+  const end = $.turn.complete(ended('T2'))
+  await seen.clock.settle() // as far as it gets while the write waits
+  expect(seen.gated).toContain('resume prompt queued: turn T2 ended after 1 tool calls')
+  await $.turn.start({ turnId: 'T3', text: 'agent message' })
+  const request = $.tool.call({ tool: TOOL, carry: 'new' } as never)
+  await seen.clock.settle()
+  expect(droppedByRequest(seen)).toBe(true)
+  open()
+  await request
+  await end
+  await seen.clock.settle()
+  seen.hold = false
+  expect(JSON.stringify(await asHost($, 'Port the parser'))).toContain('a newer request or a cancel replaced it')
+  expect(seen.prompts).toEqual([])
+})
+
+test('resume: a request while the send after the short wait is being logged still withholds the prompt', async ($, on) => {
+  const seen = world(on)
+  seen.hold = true
+  await compactWithResume($, seen)
+  const open = slowWrite(seen)
+  await seen.clock.advance(SETTLE_MS) // as far as it gets while the write waits
+  expect(seen.gated).toContain('resume prompt queued')
+  await $.turn.start({ turnId: 'T2', text: 'agent message' })
+  const request = $.tool.call({ tool: TOOL, carry: 'new' } as never)
+  await seen.clock.settle()
+  expect(droppedByRequest(seen)).toBe(true)
+  open()
+  await request
+  await seen.clock.settle()
   seen.hold = false
   expect(JSON.stringify(await asHost($, 'Port the parser'))).toContain('a newer request or a cancel replaced it')
   expect(seen.prompts).toEqual([])
