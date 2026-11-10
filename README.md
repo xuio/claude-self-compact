@@ -39,7 +39,7 @@ The same plugin is also shipped in the
 [multi-agent playbook](https://github.com/xuio/claude-code-multi-agent-playbook/tree/main/plugins/self-compact)
 repository. Install it from one place only: both copies register the same tools.
 
-Requires a Claude Code build with the plugin mods API (function hooks). Version 0.5.0 passes
+Requires a Claude Code build with the plugin mods API (function hooks). Version 0.5.1 passes
 `claude plugin test` on 2.1.301 and type-checks against the 2.1.321 API. The API is early
 access and may change between releases.
 
@@ -79,10 +79,16 @@ stays visible.
 | Case | What the tool answers |
 | --- | --- |
 | A **sub-agent** calls either tool | Refused. The tool compacts the main conversation, so a sub-agent's call would compact (or un-schedule) under the main agent. The answer tells the sub-agent to write its state down and hand off. |
-| More than `burstLimit` self-compactions in `burstWindowMinutes` | Refused, with the time until the next one is allowed. This stops a loop (compact, resume, compact, ...) without blocking a second compaction that is needed because the context filled up again. |
-| The context holds fewer than `minContextTokens` tokens | Refused: a compaction now would free almost nothing. Skipped where the host does not report the size. |
-| Within `minIntervalMinutes` of the last self-compaction | Refused, with the time left. Off by default. |
+| More than `burstLimit` self-compactions in `burstWindowMinutes` | Refused, with the time until the next one is allowed. Only when `burstLimit` is set. |
+| The context holds fewer than `minContextTokens` tokens | Refused: a compaction now would free almost nothing. Only when `minContextTokens` is set; skipped where the host does not report the size. |
+| Within `minIntervalMinutes` of the last self-compaction | Refused, with the time left. Only when `minIntervalMinutes` is set. |
 | A field is too long or misspelled | Refused, with the lengths or the field names. An earlier request in the same turn stays as it was. |
+
+The three limits (burst, context size, interval) are **off by default**: out of the box no
+request is refused for how often or how early it comes. Set them when a session falls into a loop (compact, resume,
+compact, ...): `burstLimit: 3` over a 30-minute window stops the loop without blocking a second
+compaction that is needed because the context filled up again, and `minContextTokens: 40000`
+refuses a compaction that would free almost nothing.
 
 A replacement of a request that is already scheduled is never refused by the three limits.
 
@@ -125,9 +131,9 @@ Set with `/config` (or `pluginConfigs` in `settings.json`):
 | `alwaysCarry` | empty | Placed verbatim after the summary on every self-compaction, e.g. `Re-read docs/HANDOFF.md before continuing.` |
 | `blockToolsAfterRequest` | true | While a request waits, refuse the main agent's other tool calls. `false`: only remind. |
 | `allowAfterRequest` | empty | Tool names, separated by commas, that stay allowed while a request waits. A trailing `*` matches a prefix: `SendMessage, mcp__notes__*`. |
-| `burstLimit` | 3 | Most self-compactions per window in one session. 0 = no limit. |
-| `burstWindowMinutes` | 30 | The window the limit counts over. |
-| `minContextTokens` | 40000 | Smallest context worth compacting. 0 = no check. |
+| `burstLimit` | 0 | Most self-compactions per window in one session. 0 = no limit. |
+| `burstWindowMinutes` | 30 | The window `burstLimit` counts over. |
+| `minContextTokens` | 0 | Smallest context worth compacting. 0 = no check. |
 | `minIntervalMinutes` | 0 | Fixed minimum time between two self-compactions. 0 = off. |
 
 ### Where the two "always" options do not reach
@@ -178,6 +184,10 @@ The log is a debugging aid, not a record.
 
 ## Changes since 0.3.2
 
+**0.5.1: no limits by default.** `burstLimit` and `minContextTokens` now default to 0 (off);
+0.4.0 and 0.5.0 shipped them as 3 per 30 minutes and 40,000 tokens. Set them in the options if
+you want them.
+
 **0.5.0: the turn ends.** After a request the main agent's other tool calls are refused until
 the compaction has run, and a turn that still goes on is ended by the plugin (see "The turn
 has to end"). Before, the request depended on the agent ending its turn by itself, and it
@@ -188,7 +198,8 @@ often did not.
 
 - **Rate limit.** The fixed "one self-compaction per 10 minutes" rule refused legitimate
   requests (5 in that log) and did not say when to retry. It is replaced by the burst limit
-  and the small-context check above; `minIntervalMinutes` stays as an option, default 0.
+  and the small-context check above (both optional since 0.5.1); `minIntervalMinutes` stays as
+  an option, default 0.
 - **`alwaysInstructions` and `alwaysCarry` now work on self-compactions.** Before, they were
   applied only by the `session.compact` hook, which does not see a compaction the plugin
   starts itself, so they were silently lost every time.
@@ -204,7 +215,7 @@ often did not.
   vanished without a word; Claude could believe its context had been compacted.
 - **Log lines carry the session id**, and one session's lines no longer overwrite each other.
 
-Both versions are covered by the tests in `hooks/register.test.ts` (35 tests). At the time of
+All of this is covered by the tests in `hooks/register.test.ts` (36 tests). At the time of
 writing they had not yet run in a long live session; ending a turn from the plugin in
 particular has only run in the test engine.
 

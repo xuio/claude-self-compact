@@ -235,20 +235,28 @@ test('a second self-compaction a minute later is allowed by default', async ($, 
   expect(JSON.stringify(res)).toContain('Compaction scheduled')
 })
 
-test('the burst limit refuses the next request and says when to retry', async ($, on) => {
+// Since 0.5.1 the limits are options: nothing is refused for its rate or its
+// size unless burstLimit, minIntervalMinutes or minContextTokens is set.
+test('by default there is no burst limit', async ($, on) => {
+  world(on, { lastAt: { S1: [NOW - 9 * MIN, NOW - 7 * MIN, NOW - 5 * MIN, NOW - 3 * MIN, NOW - MIN] } })
+  const res = await $.tool.call({ tool: TOOL } as never)
+  expect(JSON.stringify(res)).toContain('Compaction scheduled')
+})
+
+test('the burst limit refuses the next request and says when to retry', { options: { burstLimit: 3 } }, async ($, on) => {
   world(on, { lastAt: { S1: [NOW - 25 * MIN, NOW - 10 * MIN, NOW - MIN] } })
   const res = JSON.stringify(await $.tool.call({ tool: TOOL } as never))
   expect(res).toContain('Not scheduled: 3 self-compactions in the last 30 min')
   expect(res).toContain('allowed in 5 min')
 })
 
-test('self-compactions older than the window do not count', async ($, on) => {
+test('self-compactions older than the window do not count', { options: { burstLimit: 3 } }, async ($, on) => {
   world(on, { lastAt: { S1: [NOW - 40 * MIN, NOW - 10 * MIN, NOW - MIN] } })
   const res = await $.tool.call({ tool: TOOL } as never)
   expect(JSON.stringify(res)).toContain('Compaction scheduled')
 })
 
-test('every self-compaction is recorded, so the burst limit holds across turns', async ($, on) => {
+test('every self-compaction is recorded, so the burst limit holds across turns', { options: { burstLimit: 3 } }, async ($, on) => {
   const store: Record<string, unknown> = {}
   const seen = world(on, store, true)
   for (const turn of ['T1', 'T2', 'T3']) {
@@ -264,7 +272,7 @@ test('every self-compaction is recorded, so the burst limit holds across turns',
   expect(fourth).toContain('Not scheduled: 3 self-compactions')
 })
 
-test('a context that is still small is refused; an unknown size is not', async ($, on) => {
+test('a context that is still small is refused; an unknown size is not', { options: { minContextTokens: 40000 } }, async ($, on) => {
   const seen = world(on)
   seen.usage = 20_000
   const small = JSON.stringify(await $.tool.call({ tool: TOOL } as never))
@@ -274,7 +282,7 @@ test('a context that is still small is refused; an unknown size is not', async (
   expect(JSON.stringify(unknown)).toContain('Compaction scheduled')
 })
 
-test('minContextTokens 0 switches the size check off', { options: { minContextTokens: 0 } }, async ($, on) => {
+test('by default a small context is not refused', async ($, on) => {
   const seen = world(on)
   seen.usage = 20_000
   const res = JSON.stringify(await $.tool.call({ tool: TOOL } as never))

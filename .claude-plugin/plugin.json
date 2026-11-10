@@ -1,6 +1,6 @@
 {
   "name": "self-compact",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Lets Claude compact its own context (a real /compact: the chat history stays visible), carry text verbatim across it and resume itself",
   "author": {
     "name": "Moritz Hoffmann",
@@ -34,25 +34,25 @@
     "burstLimit": {
       "type": "number",
       "title": "Most self-compactions per window",
-      "description": "The request_compaction tool refuses a new request once this many self-compactions ran in the window below, in the same session. 0 = no limit.",
-      "default": 3
+      "description": "The request_compaction tool refuses a new request once this many self-compactions ran in the window below, in the same session. 0 = no limit (the default).",
+      "default": 0
     },
     "burstWindowMinutes": {
       "type": "number",
       "title": "Window for the limit above, in minutes",
-      "description": "The time span the burst limit counts over.",
+      "description": "The time span the burst limit counts over, when one is set.",
       "default": 30
     },
     "minContextTokens": {
       "type": "number",
       "title": "Smallest context worth compacting, in tokens",
-      "description": "The tool refuses a request while the context holds fewer tokens than this (where the host reports the size). 0 = no check.",
-      "default": 40000
+      "description": "The tool refuses a request while the context holds fewer tokens than this (where the host reports the size). 0 = no check (the default).",
+      "default": 0
     },
     "minIntervalMinutes": {
       "type": "number",
       "title": "Minimum minutes between self-compactions",
-      "description": "The tool refuses a new request within this many minutes of the last self-compaction in the same session. 0 = off (the default since 0.4; it was 10 before).",
+      "description": "The tool refuses a new request within this many minutes of the last self-compaction in the same session. 0 = off (the default; it was 10 before 0.4).",
       "default": 0
     }
   },

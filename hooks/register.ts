@@ -41,9 +41,10 @@ import type { EngineInterface as Engine, Register, SessionMessage } from 'claude
 //   - only the main agent: a sub-agent's call is refused (it would compact the
 //     main conversation, not its own);
 //   - one request at a time;
-//   - a burst limit (burstLimit self-compactions per burstWindowMinutes, kept in
-//     $.store per session, so a reload does not reset it), an optional fixed
-//     interval (minIntervalMinutes) and a "context still small" check
+//   - three optional limits, all off unless the options set them: a burst
+//     limit (burstLimit self-compactions per burstWindowMinutes, kept in
+//     $.store per session, so a reload does not reset it), a fixed interval
+//     (minIntervalMinutes) and a "context still small" check
 //     (minContextTokens); a refusal says why and when to retry;
 //   - nothing is cut: a field longer than MAX_TEXT, or an unknown field, refuses
 //     the request;
@@ -92,9 +93,9 @@ type Config = {
 
 let cfg: Config = {
   minIntervalMs: 0,
-  burstLimit: 3,
+  burstLimit: 0,
   burstWindowMs: 30 * 60_000,
-  minContextTokens: 40_000,
+  minContextTokens: 0,
   blockTools: true,
   allowAfter: [],
 }
@@ -346,9 +347,9 @@ export const register: Register = (on, options) => {
     alwaysInstructions: str(options.alwaysInstructions)?.slice(0, MAX_TEXT),
     alwaysCarry: str(options.alwaysCarry)?.slice(0, MAX_TEXT),
     minIntervalMs: num(options.minIntervalMinutes, 0) * 60_000,
-    burstLimit: Math.floor(num(options.burstLimit, 3)),
+    burstLimit: Math.floor(num(options.burstLimit, 0)),
     burstWindowMs: num(options.burstWindowMinutes, 30) * 60_000,
-    minContextTokens: num(options.minContextTokens, 40_000),
+    minContextTokens: num(options.minContextTokens, 0),
     blockTools: options.blockToolsAfterRequest !== false && options.blockToolsAfterRequest !== 'false',
     allowAfter: (str(options.allowAfterRequest) ?? '').split(/[\s,]+/).filter(Boolean),
   }
